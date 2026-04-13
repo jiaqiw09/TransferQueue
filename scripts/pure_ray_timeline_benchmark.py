@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2025 The TransferQueue Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import argparse
+import csv
+import json
+import logging
+import os
+import re
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import ray
+
+repo_root = Path(__file__).resolve().parent.parent
+sys.path.append(str(repo_root))
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
+
+MB = 1024**2
+GB = 1024**3
+
+SERIALIZE_KEYWORDS = (
+    "serialize",
+    "serialization",
+    "pickle",
+    "cloudpickle",
+    "dumps",
+    "dump",
+    "msgpack",
+)
+DESERIALIZE_KEYWORDS = (
+    "deserialize",
+    "deserialization",
+    "unpickle",
+    "loads",
+    "load",
+)
+TRANSFER_KEYWORDS = (
+    "transfer",
+    "object_manager",
+    "pull",
+    "push",
+    "send",
+    "receive",
+    "fetch",
+    "transport",
+)
+
+
+def format_bytes(num_bytes: int) -> str:
+    if num_bytes >= GB:
+        return f"{num_bytes / GB:.2f} GB"
+    if num_bytes >= MB:
+        return f"{num_bytes / MB:.2f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.2f} KB"
+    return f"{num_bytes} B"
+
+
+def bytes_to_gbps(num_bytes: int, seconds: float) -> float:
+    if seconds <= 0:
+        return 0.0
+    return (num_bytes * 8) / seconds / 1e9
+
+
+def build_size_sweep(start_mb: int, end_gb: int, multiplier: int) -> list[int]:
+    start_bytes = start_mb * MB
+    end_bytes = end_gb * GB
+    if start_bytes <= 0:
+        raise ValueError("start_mb must be positive")
+    if end_bytes < start_bytes:
+        raise ValueError("end_gb must be >= start_mb")
+    if multiplier < 2:
+        raise ValueError("multiplier must be >= 2")
+
+    sizes = []
+    current = start_bytes
+    while current <= end_bytes:
+        sizes.append(current)
+        current *= multiplier
+    return sizes
+
+
+def parse_size_list_mb(size_list_mb: str) -> list[int]:
+    values = []
+    for chunk in size_list_mb.split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        values.append(int(value) * MB)
+    if not values:
+        raise ValueError("size-list-mb did not contain any valid sizes")
+    return values
+
+
+def sanitize_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
+
+
+def import_torch_modules():
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required for torch-based payload modes") from exc
+
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        torch_npu = None
+    else:
+        torch_npu = sys.modules.get("torch_npu")
+
+    return torch, torch_npu
+
+
+def compute_bytes_for_payload(payload: Any) -> int:
+    if isinstance(payload, np.ndarray):
+        return int(payload.nbytes)
+
+    try:
+        torch, _ = import_torch_modules()
+    except RuntimeError:
+        torch = None
+
+    if torch is not None and isinstance(payload, torch.Tensor):
+        return int(payload.numel() * payload.element_size())
+
+    raise TypeError(f"Unsupported payload type for size calculation: {type(payload)}")
+
+
+def load_timeline_events(timeline_path: str) -> list[dict[str, Any]]:
+    with open(timeline_path) as f:
+        payload = json.load(f)
+    if isinstance(payload, dict):
+        if "traceEvents" in payload and isinstance(payload["traceEvents"], list):
+            return payload["traceEvents"]
+        if "events" in payload and isinstance(payload["events"], list):
+            return payload["events"]
+    if isinstance(payload, list):
+        return payload
+    raise ValueError(f"Unsupported timeline format in {timeline_path}")
+
+
+def event_overlaps_window(event: dict[str, Any], start_us: float, end_us: float) -> bool:
+    event_start = float(event.get("ts", 0.0))
+    event_duration = float(event.get("dur", 0.0))
+    event_end = event_start + event_duration
+    return event_start <= end_us and event_end >= start_us
+
+
+def flatten_event_text(event: dict[str, Any]) -> str:
+    parts = [
+        str(event.get("name", "")),
+        str(event.get("cat", "")),
+        str(event.get("ph", "")),
+        json.dumps(event.get("args", {}), sort_keys=True, default=str),
+    ]
+    return " ".join(parts).lower()
+
+
+def classify_event(event: dict[str, Any]) -> str | None:
+    text = flatten_event_text(event)
+    if any(keyword in text for keyword in DESERIALIZE_KEYWORDS):
+        return "deserialize"
+    if any(keyword in text for keyword in SERIALIZE_KEYWORDS):
+        return "serialize"
+    if any(keyword in text for keyword in TRANSFER_KEYWORDS):
+        return "transfer"
+    return None
+
+
+def summarize_timeline_window(timeline_path: str, start_us: float, end_us: float) -> dict[str, Any]:
+    events = load_timeline_events(timeline_path)
+    window_events = [event for event in events if event_overlaps_window(event, start_us, end_us)]
+
+    buckets = {
+        "serialize": [],
+        "transfer": [],
+        "deserialize": [],
+        "other": [],
+    }
+
+    for event in window_events:
+        bucket = classify_event(event) or "other"
+        buckets[bucket].append(event)
+
+    def pack(bucket_name: str) -> dict[str, Any]:
+        bucket_events = buckets[bucket_name]
+        total_us = sum(float(event.get("dur", 0.0)) for event in bucket_events)
+        return {
+            "event_count": len(bucket_events),
+            "total_us": total_us,
+            "total_ms": total_us / 1000.0,
+            "sample_names": sorted({str(event.get("name", "")) for event in bucket_events if event.get("name")})[:10],
+        }
+
+    return {
+        "window_start_us": start_us,
+        "window_end_us": end_us,
+        "window_duration_ms": (end_us - start_us) / 1000.0,
+        "total_events_in_window": len(window_events),
+        "serialize": pack("serialize"),
+        "transfer": pack("transfer"),
+        "deserialize": pack("deserialize"),
+        "other": pack("other"),
+    }
+
+
+def warn_if_timeline_env_missing() -> None:
+    profiling = os.getenv("RAY_PROFILING")
+    report_interval = os.getenv("RAY_task_events_report_interval_ms")
+    if profiling != "1" or report_interval != "0":
+        logger.warning(
+            "Timeline usually needs RAY_PROFILING=1 and RAY_task_events_report_interval_ms=0 "
+            "to be set before starting Ray on every node."
+        )
+
+
+def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for result in results:
+        if "error" in result:
+            rows.append(
+                {
+                    "payload_bytes": result.get("payload_bytes"),
+                    "payload_human": result.get("payload_human"),
+                    "round": result.get("round"),
+                    "status": "error",
+                    "error": result.get("error"),
+                }
+            )
+            continue
+
+        timeline_summary = result["timeline_summary"]
+        rows.append(
+            {
+                "payload_bytes": result["payload_bytes"],
+                "payload_human": result["payload_human"],
+                "round": result["round"],
+                "status": "ok",
+                "writer_create_seconds": result["writer_create_seconds"],
+                "writer_put_seconds": result["writer_put_seconds"],
+                "reader_consume_seconds": result["reader_consume_seconds"],
+                "end_to_end_seconds": result["end_to_end_seconds"],
+                "end_to_end_gbps": result["end_to_end_gbps"],
+                "writer_payload_bytes": result["writer_payload_bytes"],
+                "writer_device": result["writer_device"],
+                "reader_device": result["reader_device"],
+                "serialize_ms": timeline_summary["serialize"]["total_ms"],
+                "transfer_ms": timeline_summary["transfer"]["total_ms"],
+                "deserialize_ms": timeline_summary["deserialize"]["total_ms"],
+                "serialize_events": timeline_summary["serialize"]["event_count"],
+                "transfer_events": timeline_summary["transfer"]["event_count"],
+                "deserialize_events": timeline_summary["deserialize"]["event_count"],
+                "window_duration_ms": timeline_summary["window_duration_ms"],
+                "timeline_file": result["timeline_file"],
+                "error": "",
+            }
+        )
+    return rows
+
+
+def write_summary_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "payload_bytes",
+        "payload_human",
+        "round",
+        "status",
+        "writer_create_seconds",
+        "writer_put_seconds",
+        "reader_consume_seconds",
+        "end_to_end_seconds",
+        "end_to_end_gbps",
+        "writer_payload_bytes",
+        "writer_device",
+        "reader_device",
+        "serialize_ms",
+        "transfer_ms",
+        "deserialize_ms",
+        "serialize_events",
+        "transfer_events",
+        "deserialize_events",
+        "window_duration_ms",
+        "timeline_file",
+        "error",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
+@ray.remote(num_cpus=1)
+class WriterActor:
+    def __init__(self, payload_kind: str, dtype: str, fill_value: float, tensor_transport: str | None, npu_device: int):
+        self.payload_kind = payload_kind
+        self.dtype_name = dtype
+        self.fill_value = fill_value
+        self.tensor_transport = tensor_transport
+        self.npu_device = npu_device
+        self.numpy_dtype = np.dtype(dtype) if payload_kind == "cpu-numpy" else None
+        self.torch = None
+
+        if payload_kind in ("cpu-torch", "npu-torch"):
+            self.torch, _ = import_torch_modules()
+            if payload_kind == "npu-torch":
+                if not hasattr(self.torch, "npu") or not self.torch.npu.is_available():
+                    raise RuntimeError("payload-kind=npu-torch requires torch.npu to be available")
+                self.torch.npu.set_device(npu_device)
+
+    def _create_payload(self, payload_bytes: int):
+        if self.payload_kind == "cpu-numpy":
+            assert self.numpy_dtype is not None
+            if payload_bytes % self.numpy_dtype.itemsize != 0:
+                raise ValueError(
+                    f"payload_bytes={payload_bytes} must be divisible by dtype size {self.numpy_dtype.itemsize}"
+                )
+            num_elements = payload_bytes // self.numpy_dtype.itemsize
+            payload = np.full((num_elements,), self.fill_value, dtype=self.numpy_dtype)
+            return payload, int(num_elements), str(payload.dtype), list(payload.shape), "cpu"
+
+        assert self.torch is not None
+        torch = self.torch
+        torch_dtype = getattr(torch, self.dtype_name, None)
+        if torch_dtype is None:
+            raise ValueError(f"Unsupported torch dtype: {self.dtype_name}")
+        itemsize = torch.tensor([], dtype=torch_dtype).element_size()
+        if payload_bytes % itemsize != 0:
+            raise ValueError(f"payload_bytes={payload_bytes} must be divisible by dtype size {itemsize}")
+        num_elements = payload_bytes // itemsize
+
+        device = "cpu"
+        if self.payload_kind == "npu-torch":
+            device = f"npu:{self.npu_device}"
+        payload = torch.full((num_elements,), self.fill_value, dtype=torch_dtype, device=device)
+        return payload, int(num_elements), str(payload.dtype), list(payload.shape), str(payload.device)
+
+    def create_payload_and_put(self, payload_bytes: int) -> dict[str, Any]:
+        create_start = time.perf_counter()
+        payload, num_elements, dtype_name, shape, device = self._create_payload(payload_bytes)
+        create_seconds = time.perf_counter() - create_start
+
+        put_start = time.perf_counter()
+        if (
+            self.payload_kind == "npu-torch"
+            and self.tensor_transport
+            and self.torch is not None
+            and isinstance(payload, self.torch.Tensor)
+        ):
+            object_ref = ray.put(payload, _tensor_transport=self.tensor_transport)
+        else:
+            object_ref = ray.put(payload)
+        put_seconds = time.perf_counter() - put_start
+        payload_bytes_actual = compute_bytes_for_payload(payload)
+
+        return {
+            "object_ref": object_ref,
+            "payload_bytes": payload_bytes_actual,
+            "num_elements": num_elements,
+            "dtype": dtype_name,
+            "shape": shape,
+            "device": device,
+            "create_seconds": create_seconds,
+            "put_seconds": put_seconds,
+        }
+
+
+@ray.remote(num_cpus=1)
+class ReaderActor:
+    def __init__(self, payload_kind: str, npu_device: int):
+        self.payload_kind = payload_kind
+        self.npu_device = npu_device
+        self.torch = None
+        if payload_kind in ("cpu-torch", "npu-torch"):
+            self.torch, _ = import_torch_modules()
+            if payload_kind == "npu-torch":
+                if not hasattr(self.torch, "npu") or not self.torch.npu.is_available():
+                    raise RuntimeError("payload-kind=npu-torch requires torch.npu to be available")
+                self.torch.npu.set_device(npu_device)
+
+    def consume_object_ref(self, payload_packet: dict[str, Any]) -> dict[str, Any]:
+        receive_start = time.perf_counter()
+        payload = ray.get(payload_packet["object_ref"])
+        receive_seconds = time.perf_counter() - receive_start
+
+        if isinstance(payload, np.ndarray):
+            checksum = float(np.sum(payload[: min(payload.size, 1024)], dtype=np.float64))
+            shape = list(payload.shape)
+            dtype = str(payload.dtype)
+            device = "cpu"
+        else:
+            assert self.torch is not None
+            torch = self.torch
+            if not isinstance(payload, torch.Tensor):
+                raise TypeError(f"Unexpected payload type: {type(payload)}")
+            checksum = float(payload[: min(payload.numel(), 1024)].float().sum().item())
+            shape = list(payload.shape)
+            dtype = str(payload.dtype)
+            device = str(payload.device)
+
+        return {
+            "payload_bytes": compute_bytes_for_payload(payload),
+            "checksum": checksum,
+            "shape": shape,
+            "dtype": dtype,
+            "device": device,
+            "consume_seconds": receive_seconds,
+        }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Pure Ray dual-node transfer benchmark with timeline dump and heuristic timeline summary"
+    )
+    parser.add_argument("--writer-ip", type=str, required=True, help="Node IP for WriterActor (machine A)")
+    parser.add_argument("--reader-ip", type=str, required=True, help="Node IP for ReaderActor (machine B)")
+    parser.add_argument("--start-mb", type=int, default=16, help="Sweep start size in MB")
+    parser.add_argument("--end-gb", type=int, default=32, help="Sweep end size in GB")
+    parser.add_argument("--multiplier", type=int, default=2, help="Sweep multiplier between consecutive points")
+    parser.add_argument(
+        "--size-list-mb",
+        type=str,
+        default=None,
+        help="Optional comma-separated override for exact sweep sizes in MB, e.g. 16,32,64,128",
+    )
+    parser.add_argument("--rounds", type=int, default=1, help="Benchmark rounds per payload size")
+    parser.add_argument(
+        "--payload-kind",
+        type=str,
+        default="cpu-torch",
+        choices=["cpu-numpy", "cpu-torch", "npu-torch"],
+        help="Payload materialization mode. Default is cpu-torch for CPU-path benchmarking.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        help="Payload dtype. cpu-numpy uses NumPy dtype names; torch modes use torch dtype names.",
+    )
+    parser.add_argument("--fill-value", type=float, default=1.0, help="Constant used to materialize the payload")
+    parser.add_argument(
+        "--tensor-transport",
+        type=str,
+        default="nixl",
+        help="Tensor transport passed to ray.put(..., _tensor_transport=...). Only used for npu-torch.",
+    )
+    parser.add_argument("--writer-npu-device", type=int, default=0, help="NPU device id on writer node")
+    parser.add_argument("--reader-npu-device", type=int, default=0, help="NPU device id on reader node")
+    parser.add_argument(
+        "--timeline-dir",
+        type=str,
+        default="ray_timeline_outputs",
+        help="Directory to store raw Ray timeline dumps",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="pure_ray_timeline_benchmark.json",
+        help="Output JSON path",
+    )
+    parser.add_argument(
+        "--summary-csv",
+        type=str,
+        default=None,
+        help="Optional CSV summary path. Defaults to <output_basename>.csv",
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop the sweep immediately on the first failing size",
+    )
+    args = parser.parse_args()
+
+    warn_if_timeline_env_missing()
+
+    sweep_sizes = parse_size_list_mb(args.size_list_mb) if args.size_list_mb else build_size_sweep(
+        start_mb=args.start_mb,
+        end_gb=args.end_gb,
+        multiplier=args.multiplier,
+    )
+    timeline_dir = Path(args.timeline_dir)
+    timeline_dir.mkdir(parents=True, exist_ok=True)
+    summary_csv = args.summary_csv or str(Path(args.output).with_suffix(".csv"))
+
+    cwd = os.getcwd()
+    if not ray.is_initialized():
+        ray.init(address="auto", runtime_env={"working_dir": cwd})
+
+    logger.info(
+        "Benchmark topology: writer=%s reader=%s",
+        args.writer_ip,
+        args.reader_ip,
+    )
+    logger.info(
+        "Sweep sizes: %s",
+        ", ".join(format_bytes(size) for size in sweep_sizes),
+    )
+
+    writer = None
+    reader = None
+    results = []
+
+    try:
+        writer = WriterActor.options(
+            resources={f"node:{args.writer_ip}": 0.001},
+            runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
+        ).remote(args.payload_kind, args.dtype, args.fill_value, args.tensor_transport, args.writer_npu_device)
+        reader = ReaderActor.options(
+            resources={f"node:{args.reader_ip}": 0.001},
+            runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
+        ).remote(args.payload_kind, args.reader_npu_device)
+
+        for payload_bytes in sweep_sizes:
+            for round_idx in range(args.rounds):
+                payload_human = format_bytes(payload_bytes)
+                logger.info(
+                    "Running payload=%s round=%s/%s",
+                    payload_human,
+                    round_idx + 1,
+                    args.rounds,
+                )
+
+                timeline_start_us = time.time() * 1e6
+                try:
+                    produce_start = time.perf_counter()
+                    payload_ref = writer.create_payload_and_put.remote(payload_bytes)
+                    consume_ref = reader.consume_object_ref.remote(payload_ref)
+                    consume_summary = ray.get(consume_ref)
+                    end_to_end_seconds = time.perf_counter() - produce_start
+                    timeline_end_us = time.time() * 1e6
+
+                    payload_packet = ray.get(payload_ref)
+
+                    timeline_filename = (
+                        f"timeline_{sanitize_name(payload_human)}_round{round_idx + 1}.json"
+                    )
+                    timeline_path = timeline_dir / timeline_filename
+                    ray.timeline(filename=str(timeline_path))
+                    timeline_summary = summarize_timeline_window(
+                        str(timeline_path),
+                        timeline_start_us,
+                        timeline_end_us,
+                    )
+
+                    result = {
+                        "round": round_idx + 1,
+                        "writer_ip": args.writer_ip,
+                        "reader_ip": args.reader_ip,
+                        "payload_bytes": payload_bytes,
+                        "payload_human": payload_human,
+                        "timeline_file": str(timeline_path),
+                        "end_to_end_seconds": end_to_end_seconds,
+                        "end_to_end_gbps": bytes_to_gbps(payload_bytes, end_to_end_seconds),
+                        "writer_device": payload_packet["device"],
+                        "writer_dtype": payload_packet["dtype"],
+                        "writer_shape": payload_packet["shape"],
+                        "writer_num_elements": payload_packet["num_elements"],
+                        "writer_create_seconds": payload_packet["create_seconds"],
+                        "writer_put_seconds": payload_packet["put_seconds"],
+                        "writer_payload_bytes": payload_packet["payload_bytes"],
+                        "reader_payload_bytes": consume_summary["payload_bytes"],
+                        "reader_checksum": consume_summary["checksum"],
+                        "reader_shape": consume_summary["shape"],
+                        "reader_dtype": consume_summary["dtype"],
+                        "reader_device": consume_summary["device"],
+                        "reader_consume_seconds": consume_summary["consume_seconds"],
+                        "timeline_summary": timeline_summary,
+                    }
+                    results.append(result)
+
+                    logger.info(
+                        "Done payload=%s | e2e=%.4fs (%.2f Gbps) | timeline serialize=%.2fms transfer=%.2fms deserialize=%.2fms",
+                        payload_human,
+                        result["end_to_end_seconds"],
+                        result["end_to_end_gbps"],
+                        timeline_summary["serialize"]["total_ms"],
+                        timeline_summary["transfer"]["total_ms"],
+                        timeline_summary["deserialize"]["total_ms"],
+                    )
+                except Exception as exc:
+                    error_result = {
+                        "round": round_idx + 1,
+                        "payload_bytes": payload_bytes,
+                        "payload_human": payload_human,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                    results.append(error_result)
+                    logger.exception("Benchmark failed for payload=%s round=%s", payload_human, round_idx + 1)
+                    if args.stop_on_error:
+                        raise
+
+        with open(args.output, "w") as f:
+            json.dump(
+                {
+                    "config": vars(args),
+                    "results": results,
+                },
+                f,
+                indent=2,
+            )
+        csv_rows = build_summary_csv_rows(results)
+        write_summary_csv(summary_csv, csv_rows)
+        logger.info("Results saved to %s", args.output)
+        logger.info("CSV summary saved to %s", summary_csv)
+    finally:
+        if ray.is_initialized():
+            ray.shutdown()
+
+
+if __name__ == "__main__":
+    main()
