@@ -10,6 +10,12 @@
 4. 脚本导出 Ray timeline，并对 timeline 事件做一个启发式分类汇总
 5. 脚本额外导出一份 CSV summary，方便按 sweep 看表
 
+默认情况下：
+
+- 总 payload 会被切成 `8` 个等大小 chunk
+- Writer 会对这 `8` 个 chunk 分别做 `ray.put(...)`
+- Reader 会对这 `8` 个 `ObjectRef` 一次性 `ray.get(...)`
+
 脚本文件：
 
 - [pure_ray_timeline_benchmark.py](/Users/humphrey/Documents/github/tq_test/TransferQueue/scripts/pure_ray_timeline_benchmark.py:1)
@@ -31,8 +37,9 @@
 也就是：
 
 - 用 CPU 上的 `torch.Tensor` 构造 payload
-- 用 `ray.put(...)` 写入 Ray object store
-- 在远端通过 `ray.get(...)` 读取
+- 把总 payload 均分成多个 chunk
+- 对每个 chunk 执行 `ray.put(...)`
+- 在远端通过 `ray.get([...])` 一次性读取所有 chunk
 
 ## 默认 Sweep
 
@@ -77,6 +84,8 @@
   从发起写入到 Reader 消费完成的整段 wall-clock 时间
 - `writer_payload_bytes`
   payload 字节数
+- `num_chunks`
+  当前总 payload 被拆成多少个 chunk
 - `timeline_file`
   原始 Ray timeline 文件路径
 - `summary_csv`
@@ -173,6 +182,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --writer-ip 10.0.0.1 \
   --reader-ip 10.0.0.2 \
   --payload-kind cpu-torch \
+  --chunks 8 \
   --start-mb 16 \
   --end-gb 32 \
   --multiplier 2 \
@@ -189,6 +199,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --writer-ip 10.0.0.1 \
   --reader-ip 10.0.0.2 \
   --payload-kind cpu-torch \
+  --chunks 8 \
   --start-mb 16 \
   --end-gb 64 \
   --multiplier 2 \
@@ -210,6 +221,8 @@ python scripts/pure_ray_timeline_benchmark.py \
   可选 `cpu-numpy` / `cpu-torch` / `npu-torch`
 - `--dtype`
   默认 `float32`
+- `--chunks`
+  每个总 payload 切成多少个等大小 chunk，默认 `8`
 - `--rounds`
   每个 size 测几轮
 - `--size-list-mb`

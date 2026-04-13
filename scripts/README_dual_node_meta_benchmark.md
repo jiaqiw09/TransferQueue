@@ -8,6 +8,14 @@
 4. 机器 A 把 `BatchMeta` 通过 Ray 发送给机器 B 上的 `ReaderActor`
 5. 机器 B 基于这份 `BatchMeta` 从 `SimpleStorageUnit` 读取数据
 
+这个脚本现在按“**一个总 payload 会被均分成多个 chunk/sample**”来测。
+
+默认情况下：
+
+- `--chunks` 默认等于 `--shards`
+- 也就是总 payload 会均分成和 `SimpleStorageUnit` 数量相同的 sample
+- 比如 `--shards 8` 时，总 payload 会切成 `8` 个等大小 sample
+
 脚本文件：
 
 - [dual_node_meta_benchmark.py](/Users/humphrey/Documents/github/tq_test/TransferQueue/scripts/dual_node_meta_benchmark.py:1)
@@ -59,6 +67,8 @@
   按 payload 大小计算的写入吞吐
 - `read_gbps`
   按 payload 大小计算的读取吞吐
+- `summary_csv`
+  sweep 的汇总表，适合直接用表格软件看
 
 ## 前置条件
 
@@ -109,7 +119,9 @@ python scripts/dual_node_meta_benchmark.py \
   --end-gb 32 \
   --multiplier 2 \
   --shards 8 \
+  --chunks 8 \
   --rounds 1 \
+  --summary-csv dual_node_meta_benchmark.csv \
   --output dual_node_meta_benchmark.json
 ```
 
@@ -125,7 +137,9 @@ python scripts/dual_node_meta_benchmark.py \
   --end-gb 64 \
   --multiplier 2 \
   --shards 8 \
+  --chunks 8 \
   --rounds 1 \
+  --summary-csv dual_node_meta_benchmark_64g.csv \
   --output dual_node_meta_benchmark_64g.json
 ```
 
@@ -140,11 +154,13 @@ python scripts/dual_node_meta_benchmark.py \
 - `--controller-ip`
   Controller 所在节点，默认等于 `--writer-ip`
 - `--shards`
-  机器 B 上启动多少个 `SimpleStorageUnit`
-- `--sample-size-mb`
-  单个 sample 的大小，默认 `4MB`
+  机器 B 上启动多少个 `SimpleStorageUnit`，默认 `8`
+- `--chunks`
+  每个总 payload 切成多少个等大小 sample，默认等于 `--shards`
 - `--rounds`
   每个 payload size 测几轮
+- `--summary-csv`
+  CSV 汇总表输出路径
 - `--size-list-mb`
   自定义 size 列表，比如 `16,32,64,128,256`
 - `--stop-on-error`
@@ -165,8 +181,8 @@ python scripts/dual_node_meta_benchmark.py \
 注意：
 
 - `size-list-mb` 的单位是 MB
-- 每个 size 必须能被 `--sample-size-mb` 整除
-- 默认 `sample-size-mb=4`，所以 `16MB`、`32MB`、`64MB` 这些都没问题
+- 每个 size 会先切成 `chunks` 个等大小 sample，再写入 TQ
+- 为了切分干净，payload size 需要能被 `chunks` 整除
 
 ## 输出结果
 
@@ -185,6 +201,12 @@ JSON 里主要有三部分：
 - `results`
   每个 size / round 的测试结果
 
+如果你不传 `--summary-csv`，脚本会默认生成：
+
+```bash
+<output 同名>.csv
+```
+
 ## 关于 `metadata_ray_bytes`
 
 这里的 `metadata_ray_bytes` 不是 Ray 内部网络层的精确抓包值，而是：
@@ -199,6 +221,7 @@ JSON 里主要有三部分：
 ## 注意事项
 
 - `SimpleStorageUnit` 是内存存储，测到 `32GB` 或 `64GB` 时，两边机器都要有比较充足的内存余量
+- 默认 `--shards 8 --chunks 8` 时，总 payload 会被切成 8 个 sample，分发到 8 个 `SimpleStorageUnit`
 - `put_seconds` 和 `read_seconds` 都包含了 TQ 自身序列化、ZMQ 通信、内存拷贝等开销，不是纯裸网络时间
 - `metadata_transfer_seconds` 是 `WriterActor -> ReaderActor.accept_metadata(...) -> ack` 的端到端时间，不是仅网络层时间
 - 我这边只做了脚本语法校验，没在当前环境做真实双机运行，因为当前环境没有安装 `ray`

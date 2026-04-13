@@ -24,7 +24,9 @@ python scripts/dual_node_meta_benchmark.py \
   --end-gb 32 \
   --multiplier 2 \
   --shards 8 \
+  --chunks 8 \
   --rounds 1 \
+  --summary-csv dual_node_meta_benchmark.csv \
   --output dual_node_meta_benchmark.json
 ```
 
@@ -38,7 +40,9 @@ python scripts/dual_node_meta_benchmark.py \
   --end-gb 64 \
   --multiplier 2 \
   --shards 8 \
+  --chunks 8 \
   --rounds 1 \
+  --summary-csv dual_node_meta_benchmark_64g.csv \
   --output dual_node_meta_benchmark_64g.json
 ```
 
@@ -49,6 +53,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --writer-ip 10.0.0.1 \
   --reader-ip 10.0.0.2 \
   --payload-kind cpu-torch \
+  --chunks 8 \
   --start-mb 16 \
   --end-gb 32 \
   --multiplier 2 \
@@ -63,6 +68,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --writer-ip 10.0.0.1 \
   --reader-ip 10.0.0.2 \
   --payload-kind cpu-torch \
+  --chunks 8 \
   --start-mb 16 \
   --end-gb 64 \
   --multiplier 2 \

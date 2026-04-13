@@ -15,10 +15,10 @@
 # limitations under the License.
 
 import argparse
+import csv
 import gc
 import json
 import logging
-import math
 import os
 import sys
 import time
@@ -108,17 +108,18 @@ def build_tq_config(controller_info: Any, storage_unit_infos: Any, num_storage_u
     return config
 
 
-def compute_batch_layout(payload_bytes: int, sample_bytes: int) -> tuple[int, int]:
-    if payload_bytes % sample_bytes != 0:
+def compute_chunk_layout(payload_bytes: int, num_chunks: int) -> tuple[int, int]:
+    if num_chunks <= 0:
+        raise ValueError("num_chunks must be positive")
+    if payload_bytes % num_chunks != 0:
+        raise ValueError(f"payload_bytes={payload_bytes} must be divisible by num_chunks={num_chunks}")
+    chunk_bytes = payload_bytes // num_chunks
+    if chunk_bytes % DTYPE_BYTES != 0:
         raise ValueError(
-            f"payload_bytes={payload_bytes} is not divisible by sample_bytes={sample_bytes}. "
-            "Choose a sample size that divides every payload in the sweep."
+            f"chunk_bytes={chunk_bytes} must be divisible by dtype size {DTYPE_BYTES}. "
+            f"Adjust payload size or num_chunks={num_chunks}."
         )
-    if sample_bytes % DTYPE_BYTES != 0:
-        raise ValueError(f"sample_bytes={sample_bytes} must be divisible by dtype size {DTYPE_BYTES}")
-    batch_size = payload_bytes // sample_bytes
-    elems_per_sample = sample_bytes // DTYPE_BYTES
-    return batch_size, elems_per_sample
+    return num_chunks, chunk_bytes // DTYPE_BYTES
 
 
 def tensor_payload_nbytes(batch: TensorDict) -> int:
@@ -180,21 +181,21 @@ class ReaderActor:
 
 @ray.remote(num_cpus=1)
 class WriterActor:
-    def __init__(self, tq_config: Any, sample_bytes: int, fill_value: float = 1.0):
+    def __init__(self, tq_config: Any, num_chunks: int, fill_value: float = 1.0):
         self.client = TransferQueueClient(client_id="writer", controller_info=tq_config.controller_info)
         self.client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=tq_config)
-        self.sample_bytes = sample_bytes
+        self.num_chunks = num_chunks
         self.fill_value = fill_value
 
     def _create_payload(self, payload_bytes: int) -> tuple[TensorDict, int, int]:
-        batch_size, elems_per_sample = compute_batch_layout(payload_bytes, self.sample_bytes)
-        tensor = torch.full((batch_size, elems_per_sample), self.fill_value, dtype=DTYPE)
+        batch_size, elems_per_chunk = compute_chunk_layout(payload_bytes, self.num_chunks)
+        tensor = torch.full((batch_size, elems_per_chunk), self.fill_value, dtype=DTYPE)
         batch = TensorDict({"payload": tensor}, batch_size=(batch_size,))
-        return batch, batch_size, elems_per_sample
+        return batch, batch_size, elems_per_chunk
 
     def run_single(self, reader: Any, payload_bytes: int, partition_id: str) -> dict[str, Any]:
         create_start = time.perf_counter()
-        batch, batch_size, elems_per_sample = self._create_payload(payload_bytes)
+        batch, batch_size, elems_per_chunk = self._create_payload(payload_bytes)
         create_seconds = time.perf_counter() - create_start
         actual_payload_bytes = tensor_payload_nbytes(batch)
 
@@ -217,7 +218,8 @@ class WriterActor:
         return {
             "partition_id": partition_id,
             "batch_size": batch_size,
-            "elems_per_sample": elems_per_sample,
+            "chunk_num_elements": elems_per_chunk,
+            "num_chunks": batch_size,
             "payload_bytes": actual_payload_bytes,
             "create_seconds": create_seconds,
             "put_seconds": put_seconds,
@@ -261,6 +263,78 @@ def summarize_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows = []
+    for result in results:
+        if "error" in result:
+            rows.append(
+                {
+                    "payload_bytes": result.get("payload_bytes"),
+                    "payload_human": result.get("payload_human"),
+                    "round": result.get("round"),
+                    "status": "error",
+                    "error": result.get("error"),
+                }
+            )
+            continue
+
+        rows.append(
+            {
+                "payload_bytes": result["payload_bytes"],
+                "payload_human": result["payload_human"],
+                "round": result["round"],
+                "status": "ok",
+                "num_chunks": result["num_chunks"],
+                "shards": result["shards"],
+                "create_seconds": result["create_seconds"],
+                "put_seconds": result["put_seconds"],
+                "metadata_transfer_seconds": result["metadata_transfer_seconds"],
+                "read_seconds": result["read_seconds"],
+                "total_seconds": result["total_seconds"],
+                "put_gbps": result["put_gbps"],
+                "read_gbps": result["read_gbps"],
+                "metadata_ray_bytes": result["metadata_ray_bytes"],
+                "metadata_ray_human": result["metadata_ray_human"],
+                "metadata_to_payload_ratio": result["metadata_to_payload_ratio"],
+                "chunk_num_elements": result["chunk_num_elements"],
+                "batch_size": result["batch_size"],
+                "partition_id": result["partition_id"],
+                "error": "",
+            }
+        )
+    return rows
+
+
+def write_summary_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
+    fieldnames = [
+        "payload_bytes",
+        "payload_human",
+        "round",
+        "status",
+        "num_chunks",
+        "shards",
+        "create_seconds",
+        "put_seconds",
+        "metadata_transfer_seconds",
+        "read_seconds",
+        "total_seconds",
+        "put_gbps",
+        "read_gbps",
+        "metadata_ray_bytes",
+        "metadata_ray_human",
+        "metadata_to_payload_ratio",
+        "chunk_num_elements",
+        "batch_size",
+        "partition_id",
+        "error",
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in fieldnames})
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Dual-node TransferQueue benchmark: writer put -> Ray BatchMeta transfer -> reader get_data"
@@ -281,10 +355,10 @@ def main() -> None:
     )
     parser.add_argument("--shards", type=int, default=8, help="Number of SimpleStorageUnit actors on storage node")
     parser.add_argument(
-        "--sample-size-mb",
+        "--chunks",
         type=int,
-        default=4,
-        help="Per-sample payload size in MB. Every sweep size must be divisible by this value.",
+        default=None,
+        help="Split each total payload into this many equal chunks/samples. Defaults to --shards.",
     )
     parser.add_argument("--start-mb", type=int, default=16, help="Sweep start size in MB")
     parser.add_argument("--end-gb", type=int, default=32, help="Sweep end size in GB")
@@ -303,6 +377,12 @@ def main() -> None:
         help="Output JSON path",
     )
     parser.add_argument(
+        "--summary-csv",
+        type=str,
+        default=None,
+        help="Optional CSV summary path. Defaults to <output_basename>.csv",
+    )
+    parser.add_argument(
         "--fill-value",
         type=float,
         default=1.0,
@@ -318,15 +398,16 @@ def main() -> None:
 
     reader_ip = args.reader_ip or args.storage_ip
     controller_ip = args.controller_ip or args.writer_ip
-    sample_bytes = args.sample_size_mb * MB
+    num_chunks = args.chunks or args.shards
+    summary_csv = args.summary_csv or str(Path(args.output).with_suffix(".csv"))
     sweep_sizes = parse_size_list_mb(args.size_list_mb) if args.size_list_mb else build_size_sweep(
         start_mb=args.start_mb,
         end_gb=args.end_gb,
         multiplier=args.multiplier,
     )
     max_payload_bytes = max(sweep_sizes)
-    max_batch_size, _ = compute_batch_layout(max_payload_bytes, sample_bytes)
-    storage_unit_size = max(1, math.ceil(max_batch_size / args.shards))
+    max_batch_size, _ = compute_chunk_layout(max_payload_bytes, num_chunks)
+    storage_unit_size = max(1, (max_batch_size + args.shards - 1) // args.shards)
 
     cwd = os.getcwd()
     if not ray.is_initialized():
@@ -345,9 +426,8 @@ def main() -> None:
         ", ".join(format_bytes(size) for size in sweep_sizes),
     )
     logger.info(
-        "Sample size: %s, max batch size: %s, per-shard storage capacity: %s samples",
-        format_bytes(sample_bytes),
-        max_batch_size,
+        "Chunk mode: payload split into %s equal samples, per-shard storage capacity: %s samples",
+        num_chunks,
         storage_unit_size,
     )
 
@@ -367,7 +447,7 @@ def main() -> None:
         writer = WriterActor.options(
             resources={f"node:{args.writer_ip}": 0.001},
             runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
-        ).remote(tq_config, sample_bytes, args.fill_value)
+        ).remote(tq_config, num_chunks, args.fill_value)
         reader = ReaderActor.options(
             resources={f"node:{reader_ip}": 0.001},
             runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
@@ -394,7 +474,7 @@ def main() -> None:
                             "reader_ip": reader_ip,
                             "controller_ip": controller_ip,
                             "shards": args.shards,
-                            "sample_size_bytes": sample_bytes,
+                            "chunks": num_chunks,
                         }
                     )
                     results.append(result)
@@ -428,7 +508,7 @@ def main() -> None:
                     "resolved_config": {
                         "reader_ip": reader_ip,
                         "controller_ip": controller_ip,
-                        "sample_bytes": sample_bytes,
+                        "chunks": num_chunks,
                         "storage_unit_size": storage_unit_size,
                         "sweep_sizes_bytes": sweep_sizes,
                     },
@@ -437,7 +517,10 @@ def main() -> None:
                 f,
                 indent=2,
             )
+        csv_rows = build_summary_csv_rows(results)
+        write_summary_csv(summary_csv, csv_rows)
         logger.info("Results saved to %s", args.output)
+        logger.info("CSV summary saved to %s", summary_csv)
     finally:
         if ray.is_initialized():
             ray.shutdown()

@@ -81,6 +81,20 @@ def bytes_to_gbps(num_bytes: int, seconds: float) -> float:
     return (num_bytes * 8) / seconds / 1e9
 
 
+def compute_chunk_sizes(payload_bytes: int, num_chunks: int, itemsize: int) -> tuple[int, int]:
+    if num_chunks <= 0:
+        raise ValueError("num_chunks must be positive")
+    if payload_bytes % num_chunks != 0:
+        raise ValueError(f"payload_bytes={payload_bytes} must be divisible by num_chunks={num_chunks}")
+    chunk_bytes = payload_bytes // num_chunks
+    if chunk_bytes % itemsize != 0:
+        raise ValueError(
+            f"chunk_bytes={chunk_bytes} must be divisible by dtype size {itemsize}. "
+            f"Adjust payload size or num_chunks={num_chunks}."
+        )
+    return num_chunks, chunk_bytes // itemsize
+
+
 def build_size_sweep(start_mb: int, end_gb: int, multiplier: int) -> list[int]:
     start_bytes = start_mb * MB
     end_bytes = end_gb * GB
@@ -256,6 +270,7 @@ def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]
                 "payload_human": result["payload_human"],
                 "round": result["round"],
                 "status": "ok",
+                "num_chunks": result["num_chunks"],
                 "writer_create_seconds": result["writer_create_seconds"],
                 "writer_put_seconds": result["writer_put_seconds"],
                 "reader_consume_seconds": result["reader_consume_seconds"],
@@ -284,6 +299,7 @@ def write_summary_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
         "payload_human",
         "round",
         "status",
+        "num_chunks",
         "writer_create_seconds",
         "writer_put_seconds",
         "reader_consume_seconds",
@@ -311,12 +327,21 @@ def write_summary_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
 
 @ray.remote(num_cpus=1)
 class WriterActor:
-    def __init__(self, payload_kind: str, dtype: str, fill_value: float, tensor_transport: str | None, npu_device: int):
+    def __init__(
+        self,
+        payload_kind: str,
+        dtype: str,
+        fill_value: float,
+        tensor_transport: str | None,
+        npu_device: int,
+        num_chunks: int,
+    ):
         self.payload_kind = payload_kind
         self.dtype_name = dtype
         self.fill_value = fill_value
         self.tensor_transport = tensor_transport
         self.npu_device = npu_device
+        self.num_chunks = num_chunks
         self.numpy_dtype = np.dtype(dtype) if payload_kind == "cpu-numpy" else None
         self.torch = None
 
@@ -330,13 +355,11 @@ class WriterActor:
     def _create_payload(self, payload_bytes: int):
         if self.payload_kind == "cpu-numpy":
             assert self.numpy_dtype is not None
-            if payload_bytes % self.numpy_dtype.itemsize != 0:
-                raise ValueError(
-                    f"payload_bytes={payload_bytes} must be divisible by dtype size {self.numpy_dtype.itemsize}"
-                )
-            num_elements = payload_bytes // self.numpy_dtype.itemsize
-            payload = np.full((num_elements,), self.fill_value, dtype=self.numpy_dtype)
-            return payload, int(num_elements), str(payload.dtype), list(payload.shape), "cpu"
+            num_chunks, chunk_num_elements = compute_chunk_sizes(payload_bytes, self.num_chunks, self.numpy_dtype.itemsize)
+            payloads = [
+                np.full((chunk_num_elements,), self.fill_value, dtype=self.numpy_dtype) for _ in range(num_chunks)
+            ]
+            return payloads, int(chunk_num_elements), str(self.numpy_dtype), [chunk_num_elements], "cpu"
 
         assert self.torch is not None
         torch = self.torch
@@ -344,38 +367,42 @@ class WriterActor:
         if torch_dtype is None:
             raise ValueError(f"Unsupported torch dtype: {self.dtype_name}")
         itemsize = torch.tensor([], dtype=torch_dtype).element_size()
-        if payload_bytes % itemsize != 0:
-            raise ValueError(f"payload_bytes={payload_bytes} must be divisible by dtype size {itemsize}")
-        num_elements = payload_bytes // itemsize
+        num_chunks, chunk_num_elements = compute_chunk_sizes(payload_bytes, self.num_chunks, itemsize)
 
         device = "cpu"
         if self.payload_kind == "npu-torch":
             device = f"npu:{self.npu_device}"
-        payload = torch.full((num_elements,), self.fill_value, dtype=torch_dtype, device=device)
-        return payload, int(num_elements), str(payload.dtype), list(payload.shape), str(payload.device)
+        payloads = [
+            torch.full((chunk_num_elements,), self.fill_value, dtype=torch_dtype, device=device) for _ in range(num_chunks)
+        ]
+        return payloads, int(chunk_num_elements), str(torch_dtype), [chunk_num_elements], str(payloads[0].device)
 
     def create_payload_and_put(self, payload_bytes: int) -> dict[str, Any]:
         create_start = time.perf_counter()
-        payload, num_elements, dtype_name, shape, device = self._create_payload(payload_bytes)
+        payloads, chunk_num_elements, dtype_name, shape, device = self._create_payload(payload_bytes)
         create_seconds = time.perf_counter() - create_start
 
         put_start = time.perf_counter()
-        if (
-            self.payload_kind == "npu-torch"
-            and self.tensor_transport
-            and self.torch is not None
-            and isinstance(payload, self.torch.Tensor)
-        ):
-            object_ref = ray.put(payload, _tensor_transport=self.tensor_transport)
-        else:
-            object_ref = ray.put(payload)
+        object_refs = []
+        for payload in payloads:
+            if (
+                self.payload_kind == "npu-torch"
+                and self.tensor_transport
+                and self.torch is not None
+                and isinstance(payload, self.torch.Tensor)
+            ):
+                object_ref = ray.put(payload, _tensor_transport=self.tensor_transport)
+            else:
+                object_ref = ray.put(payload)
+            object_refs.append(object_ref)
         put_seconds = time.perf_counter() - put_start
-        payload_bytes_actual = compute_bytes_for_payload(payload)
+        payload_bytes_actual = sum(compute_bytes_for_payload(payload) for payload in payloads)
 
         return {
-            "object_ref": object_ref,
+            "object_refs": object_refs,
             "payload_bytes": payload_bytes_actual,
-            "num_elements": num_elements,
+            "chunk_num_elements": chunk_num_elements,
+            "num_chunks": len(payloads),
             "dtype": dtype_name,
             "shape": shape,
             "device": device,
@@ -399,26 +426,31 @@ class ReaderActor:
 
     def consume_object_ref(self, payload_packet: dict[str, Any]) -> dict[str, Any]:
         receive_start = time.perf_counter()
-        payload = ray.get(payload_packet["object_ref"])
+        payloads = ray.get(payload_packet["object_refs"])
         receive_seconds = time.perf_counter() - receive_start
 
-        if isinstance(payload, np.ndarray):
-            checksum = float(np.sum(payload[: min(payload.size, 1024)], dtype=np.float64))
-            shape = list(payload.shape)
-            dtype = str(payload.dtype)
+        first_payload = payloads[0]
+        if isinstance(first_payload, np.ndarray):
+            checksum = float(
+                sum(np.sum(payload[: min(payload.size, 1024)], dtype=np.float64) for payload in payloads)
+            )
+            shape = list(first_payload.shape)
+            dtype = str(first_payload.dtype)
             device = "cpu"
         else:
             assert self.torch is not None
             torch = self.torch
-            if not isinstance(payload, torch.Tensor):
-                raise TypeError(f"Unexpected payload type: {type(payload)}")
-            checksum = float(payload[: min(payload.numel(), 1024)].float().sum().item())
-            shape = list(payload.shape)
-            dtype = str(payload.dtype)
-            device = str(payload.device)
+            if not isinstance(first_payload, torch.Tensor):
+                raise TypeError(f"Unexpected payload type: {type(first_payload)}")
+            checksum = float(
+                sum(payload[: min(payload.numel(), 1024)].float().sum().item() for payload in payloads)
+            )
+            shape = list(first_payload.shape)
+            dtype = str(first_payload.dtype)
+            device = str(first_payload.device)
 
         return {
-            "payload_bytes": compute_bytes_for_payload(payload),
+            "payload_bytes": sum(compute_bytes_for_payload(payload) for payload in payloads),
             "checksum": checksum,
             "shape": shape,
             "dtype": dtype,
@@ -433,6 +465,7 @@ def main() -> None:
     )
     parser.add_argument("--writer-ip", type=str, required=True, help="Node IP for WriterActor (machine A)")
     parser.add_argument("--reader-ip", type=str, required=True, help="Node IP for ReaderActor (machine B)")
+    parser.add_argument("--chunks", type=int, default=8, help="Split each total payload into this many equal chunks")
     parser.add_argument("--start-mb", type=int, default=16, help="Sweep start size in MB")
     parser.add_argument("--end-gb", type=int, default=32, help="Sweep end size in GB")
     parser.add_argument("--multiplier", type=int, default=2, help="Sweep multiplier between consecutive points")
@@ -523,7 +556,14 @@ def main() -> None:
         writer = WriterActor.options(
             resources={f"node:{args.writer_ip}": 0.001},
             runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
-        ).remote(args.payload_kind, args.dtype, args.fill_value, args.tensor_transport, args.writer_npu_device)
+        ).remote(
+            args.payload_kind,
+            args.dtype,
+            args.fill_value,
+            args.tensor_transport,
+            args.writer_npu_device,
+            args.chunks,
+        )
         reader = ReaderActor.options(
             resources={f"node:{args.reader_ip}": 0.001},
             runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
@@ -573,7 +613,8 @@ def main() -> None:
                         "writer_device": payload_packet["device"],
                         "writer_dtype": payload_packet["dtype"],
                         "writer_shape": payload_packet["shape"],
-                        "writer_num_elements": payload_packet["num_elements"],
+                        "writer_chunk_num_elements": payload_packet["chunk_num_elements"],
+                        "num_chunks": payload_packet["num_chunks"],
                         "writer_create_seconds": payload_packet["create_seconds"],
                         "writer_put_seconds": payload_packet["put_seconds"],
                         "writer_payload_bytes": payload_packet["payload_bytes"],
