@@ -77,3 +77,22 @@ python scripts/pure_ray_timeline_benchmark.py \
   --summary-csv pure_ray_timeline_benchmark_64g.csv \
   --output pure_ray_timeline_benchmark_64g.json
 ```
+
+# Compare Fixed 256MB Samples
+
+```bash
+python scripts/compare_fixed_sample_sweep.py \
+  --writer-ip 10.0.0.1 \
+  --storage-ip 10.0.0.2 \
+  --reader-ip 10.0.0.2 \
+  --controller-ip 10.0.0.1 \
+  --sample-size-mb 256 \
+  --sample-count-list 1,2,4,8,16,32,64,128 \
+  --tq-shards 8 \
+  --rounds 1 \
+  --ray-payload-kind cpu-torch \
+  --ray-timeline-dir ray_object_transfer_compare_outputs \
+  --artifacts-dir compare_fixed_sample_artifacts \
+  --output-json compare_fixed_sample_sweep.json \
+  --output-csv compare_fixed_sample_sweep.csv
+```
