@@ -58,7 +58,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --end-gb 32 \
   --multiplier 2 \
   --rounds 1 \
-  --timeline-dir ray_timeline_outputs \
+  --timeline-dir ray_object_transfer_outputs \
   --summary-csv pure_ray_timeline_benchmark.csv \
   --output pure_ray_timeline_benchmark.json
 ```
@@ -73,7 +73,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --end-gb 64 \
   --multiplier 2 \
   --rounds 1 \
-  --timeline-dir ray_timeline_outputs_64g \
+  --timeline-dir ray_object_transfer_outputs_64g \
   --summary-csv pure_ray_timeline_benchmark_64g.csv \
   --output pure_ray_timeline_benchmark_64g.json
 ```

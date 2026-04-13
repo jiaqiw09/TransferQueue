@@ -7,7 +7,7 @@
 1. 机器 A 上的 `WriterActor` 构造 payload
 2. 机器 A 上调用 `ray.put(...)`
 3. 机器 B 上的 `ReaderActor` 通过 `ray.get(object_ref)` 拉取 payload
-4. 脚本导出 Ray timeline，并对 timeline 事件做一个启发式分类汇总
+4. 脚本导出 Ray object transfer trace
 5. 脚本额外导出一份 CSV summary，方便按 sweep 看表
 
 默认情况下：
@@ -86,33 +86,36 @@
   payload 字节数
 - `num_chunks`
   当前总 payload 被拆成多少个 chunk
-- `timeline_file`
-  原始 Ray timeline 文件路径
+- `object_transfer_timeline_file`
+  原始 Ray object transfer trace 文件路径
 - `summary_csv`
   sweep 的汇总表，适合直接用表格软件看
-- `timeline_summary.serialize.total_ms`
-  timeline 中被归类为“序列化”的事件总时长
-- `timeline_summary.transfer.total_ms`
-  timeline 中被归类为“传输”的事件总时长
-- `timeline_summary.deserialize.total_ms`
-  timeline 中被归类为“反序列化”的事件总时长
+- `timeline_summary.transfer_send.total_ms`
+  object transfer trace 中 `transfer_send` 的总时长
+- `timeline_summary.transfer_receive.total_ms`
+  object transfer trace 中 `transfer_receive` 的总时长
+- `timeline_summary.receive_pull_request.total_ms`
+  object transfer trace 中 `receive_pull_request` 的总时长
 
-## 关于 timeline 统计的准确性
+## 关于 object transfer trace 统计
 
 这里要特别说明一下：
 
-- 原始 timeline 文件是 Ray 真实导出的 tracing 数据
-- 但 `serialize / transfer / deserialize` 这三个汇总值，是脚本根据 event 的 `name/cat/args` 里出现的关键词做的**启发式分类**
+- 原始 object transfer trace 文件是 Ray 真实导出的 tracing 数据
+- CSV 里展示的是最直接的三类 object manager 事件：
+  - `transfer_send`
+  - `transfer_receive`
+  - `receive_pull_request`
 
 所以建议你这样用：
 
-1. 先看脚本输出的三类汇总，快速判断大头在哪
-2. 如果某个 size 很关键，再打开对应的 `timeline_file` 做细看
+1. 先看 CSV 里的 send / receive / pull 汇总
+2. 如果某个 size 很关键，再打开对应的 `object_transfer_timeline_file` 做细看
 
 也就是说：
 
-- `timeline_file` 是原始依据
-- `timeline_summary.*` 是方便批量 sweep 比较的“近似整理结果”
+- `object_transfer_timeline_file` 是原始依据
+- `timeline_summary.*` 是方便批量 sweep 比较的整理结果
 
 ## 最适合 sweep 的看法
 
@@ -120,7 +123,7 @@
 
 1. 先看脚本导出的 CSV
 2. 用 CSV 找到异常 size
-3. 再打开对应那一行里的 `timeline_file`
+3. 再打开对应那一行里的 `object_transfer_timeline_file`
 
 CSV 里会直接给你这些列：
 
@@ -131,10 +134,10 @@ CSV 里会直接给你这些列：
 - `reader_consume_seconds`
 - `end_to_end_seconds`
 - `end_to_end_gbps`
-- `serialize_ms`
-- `transfer_ms`
-- `deserialize_ms`
-- `timeline_file`
+- `transfer_send_ms`
+- `transfer_receive_ms`
+- `receive_pull_request_ms`
+- `object_transfer_timeline_file`
 
 所以如果你只是想扫一眼 sweep 结果，**优先看 CSV 就够了**。
 
@@ -154,7 +157,7 @@ CSV 里会直接给你这些列：
 - 机器 A IP: `10.0.0.1`
 - 机器 B IP: `10.0.0.2`
 
-为了让 timeline 更完整，**建议在启动 Ray 之前**，两边都先设置：
+为了让 object transfer trace 更完整，**建议在启动 Ray 之前**，两边都先设置：
 
 ```bash
 export RAY_PROFILING=1
@@ -187,7 +190,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --end-gb 32 \
   --multiplier 2 \
   --rounds 1 \
-  --timeline-dir ray_timeline_outputs \
+  --timeline-dir ray_object_transfer_outputs \
   --summary-csv pure_ray_timeline_benchmark.csv \
   --output pure_ray_timeline_benchmark.json
 ```
@@ -204,7 +207,7 @@ python scripts/pure_ray_timeline_benchmark.py \
   --end-gb 64 \
   --multiplier 2 \
   --rounds 1 \
-  --timeline-dir ray_timeline_outputs_64g \
+  --timeline-dir ray_object_transfer_outputs_64g \
   --summary-csv pure_ray_timeline_benchmark_64g.csv \
   --output pure_ray_timeline_benchmark_64g.json
 ```
@@ -228,21 +231,21 @@ python scripts/pure_ray_timeline_benchmark.py \
 - `--size-list-mb`
   自定义 size 列表，比如 `16,32,64,128,256`
 - `--timeline-dir`
-  timeline 文件输出目录
+  object transfer trace 文件输出目录
 - `--summary-csv`
   CSV 汇总表输出路径
 - `--stop-on-error`
   某个 size 出错时立即停止
 
-## 怎么看 timeline
+## 怎么看 object transfer trace
 
 推荐方式：
 
 1. 跑完脚本后，先打开 CSV
 2. 找到你想看的那一行
-3. 取这一行里的 `timeline_file`
+3. 取这一行里的 `object_transfer_timeline_file`
 4. 打开 [Perfetto UI](https://ui.perfetto.dev/)
-5. 把 `timeline_file` 拖进去
+5. 把 `object_transfer_timeline_file` 拖进去
 
 如果你想用 Chrome 老的 tracing 页面，也可以：
 
@@ -250,26 +253,23 @@ python scripts/pure_ray_timeline_benchmark.py \
 chrome://tracing
 ```
 
-然后导入对应的 `timeline_file`
+然后导入对应的 `object_transfer_timeline_file`
 
-## timeline 查看建议
+## object transfer trace 查看建议
 
-在 Perfetto 里优先看：
+在 trace 里优先看：
 
-- `serialize`
-- `deserialize`
-- `transfer`
-- `object_manager`
-- `pull`
-- `push`
-- `ray.get`
-- `ray.put`
+- `transfer_send`
+- `transfer_receive`
+- `receive_pull_request`
 
 建议做法：
 
 1. 先用 CSV 定位异常 size
-2. 再打开该 size 对应的 timeline
-3. 放大对应时间窗口，看 Writer 和 Reader 两端的事件
+2. 再打开该 size 对应的 object transfer trace
+3. 在 `chrome://tracing` 里打开 `View Options`
+4. 勾选 `Flow events`
+5. 再看对象在两台机器之间的 send / receive / pull 连线
 
 ## 和 TQ 脚本的关系
 
@@ -284,7 +284,7 @@ chrome://tracing
 
 - TQ 的 `put/get`
 - 纯 Ray 的 `ray.put/ray.get`
-- 再结合 Ray timeline 看序列化、传输、反序列化的大致开销分布
+- 再结合 Ray object transfer trace 看 send / receive / pull 的传输行为
 
 ## 当前验证情况
 

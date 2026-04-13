@@ -201,40 +201,44 @@ def classify_event(event: dict[str, Any]) -> str | None:
     return None
 
 
-def summarize_timeline_window(timeline_path: str, start_us: float, end_us: float) -> dict[str, Any]:
+def dump_object_transfer_timeline(timeline_path: str) -> None:
+    if not hasattr(ray, "object_transfer_timeline"):
+        raise RuntimeError("Current Ray version does not expose ray.object_transfer_timeline(...)")
+    ray.object_transfer_timeline(filename=timeline_path)
+
+
+def summarize_object_transfer_trace(timeline_path: str) -> dict[str, Any]:
     events = load_timeline_events(timeline_path)
-    window_events = [event for event in events if event_overlaps_window(event, start_us, end_us)]
+    transfer_send = []
+    transfer_receive = []
+    receive_pull_request = []
+    other = []
 
-    buckets = {
-        "serialize": [],
-        "transfer": [],
-        "deserialize": [],
-        "other": [],
-    }
+    for event in events:
+        name = str(event.get("name", ""))
+        duration_us = float(event.get("dur", 0.0))
+        if name == "transfer_send":
+            transfer_send.append(duration_us)
+        elif name == "transfer_receive":
+            transfer_receive.append(duration_us)
+        elif name == "receive_pull_request":
+            receive_pull_request.append(duration_us)
+        else:
+            other.append(duration_us)
 
-    for event in window_events:
-        bucket = classify_event(event) or "other"
-        buckets[bucket].append(event)
-
-    def pack(bucket_name: str) -> dict[str, Any]:
-        bucket_events = buckets[bucket_name]
-        total_us = sum(float(event.get("dur", 0.0)) for event in bucket_events)
+    def pack(values: list[float]) -> dict[str, Any]:
         return {
-            "event_count": len(bucket_events),
-            "total_us": total_us,
-            "total_ms": total_us / 1000.0,
-            "sample_names": sorted({str(event.get("name", "")) for event in bucket_events if event.get("name")})[:10],
+            "event_count": len(values),
+            "total_us": sum(values),
+            "total_ms": sum(values) / 1000.0,
         }
 
     return {
-        "window_start_us": start_us,
-        "window_end_us": end_us,
-        "window_duration_ms": (end_us - start_us) / 1000.0,
-        "total_events_in_window": len(window_events),
-        "serialize": pack("serialize"),
-        "transfer": pack("transfer"),
-        "deserialize": pack("deserialize"),
-        "other": pack("other"),
+        "total_events": len(events),
+        "transfer_send": pack(transfer_send),
+        "transfer_receive": pack(transfer_receive),
+        "receive_pull_request": pack(receive_pull_request),
+        "other": pack(other),
     }
 
 
@@ -279,14 +283,13 @@ def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]
                 "writer_payload_bytes": result["writer_payload_bytes"],
                 "writer_device": result["writer_device"],
                 "reader_device": result["reader_device"],
-                "serialize_ms": timeline_summary["serialize"]["total_ms"],
-                "transfer_ms": timeline_summary["transfer"]["total_ms"],
-                "deserialize_ms": timeline_summary["deserialize"]["total_ms"],
-                "serialize_events": timeline_summary["serialize"]["event_count"],
-                "transfer_events": timeline_summary["transfer"]["event_count"],
-                "deserialize_events": timeline_summary["deserialize"]["event_count"],
-                "window_duration_ms": timeline_summary["window_duration_ms"],
-                "timeline_file": result["timeline_file"],
+                "transfer_send_ms": timeline_summary["transfer_send"]["total_ms"],
+                "transfer_receive_ms": timeline_summary["transfer_receive"]["total_ms"],
+                "receive_pull_request_ms": timeline_summary["receive_pull_request"]["total_ms"],
+                "transfer_send_events": timeline_summary["transfer_send"]["event_count"],
+                "transfer_receive_events": timeline_summary["transfer_receive"]["event_count"],
+                "receive_pull_request_events": timeline_summary["receive_pull_request"]["event_count"],
+                "object_transfer_timeline_file": result["object_transfer_timeline_file"],
                 "error": "",
             }
         )
@@ -308,14 +311,13 @@ def write_summary_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
         "writer_payload_bytes",
         "writer_device",
         "reader_device",
-        "serialize_ms",
-        "transfer_ms",
-        "deserialize_ms",
-        "serialize_events",
-        "transfer_events",
-        "deserialize_events",
-        "window_duration_ms",
-        "timeline_file",
+        "transfer_send_ms",
+        "transfer_receive_ms",
+        "receive_pull_request_ms",
+        "transfer_send_events",
+        "transfer_receive_events",
+        "receive_pull_request_events",
+        "object_transfer_timeline_file",
         "error",
     ]
     with open(csv_path, "w", newline="") as f:
@@ -461,7 +463,7 @@ class ReaderActor:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Pure Ray dual-node transfer benchmark with timeline dump and heuristic timeline summary"
+        description="Pure Ray dual-node transfer benchmark with object transfer tracing"
     )
     parser.add_argument("--writer-ip", type=str, required=True, help="Node IP for WriterActor (machine A)")
     parser.add_argument("--reader-ip", type=str, required=True, help="Node IP for ReaderActor (machine B)")
@@ -502,7 +504,7 @@ def main() -> None:
         "--timeline-dir",
         type=str,
         default="ray_timeline_outputs",
-        help="Directory to store raw Ray timeline dumps",
+        help="Directory to store raw Ray object transfer trace dumps",
     )
     parser.add_argument(
         "--output",
@@ -579,27 +581,21 @@ def main() -> None:
                     args.rounds,
                 )
 
-                timeline_start_us = time.time() * 1e6
                 try:
                     produce_start = time.perf_counter()
                     payload_ref = writer.create_payload_and_put.remote(payload_bytes)
                     consume_ref = reader.consume_object_ref.remote(payload_ref)
                     consume_summary = ray.get(consume_ref)
                     end_to_end_seconds = time.perf_counter() - produce_start
-                    timeline_end_us = time.time() * 1e6
 
                     payload_packet = ray.get(payload_ref)
 
                     timeline_filename = (
-                        f"timeline_{sanitize_name(payload_human)}_round{round_idx + 1}.json"
+                        f"object_transfer_timeline_{sanitize_name(payload_human)}_round{round_idx + 1}.json"
                     )
                     timeline_path = timeline_dir / timeline_filename
-                    ray.timeline(filename=str(timeline_path))
-                    timeline_summary = summarize_timeline_window(
-                        str(timeline_path),
-                        timeline_start_us,
-                        timeline_end_us,
-                    )
+                    dump_object_transfer_timeline(str(timeline_path))
+                    timeline_summary = summarize_object_transfer_trace(str(timeline_path))
 
                     result = {
                         "round": round_idx + 1,
@@ -607,7 +603,7 @@ def main() -> None:
                         "reader_ip": args.reader_ip,
                         "payload_bytes": payload_bytes,
                         "payload_human": payload_human,
-                        "timeline_file": str(timeline_path),
+                        "object_transfer_timeline_file": str(timeline_path),
                         "end_to_end_seconds": end_to_end_seconds,
                         "end_to_end_gbps": bytes_to_gbps(payload_bytes, end_to_end_seconds),
                         "writer_device": payload_packet["device"],
@@ -629,13 +625,13 @@ def main() -> None:
                     results.append(result)
 
                     logger.info(
-                        "Done payload=%s | e2e=%.4fs (%.2f Gbps) | timeline serialize=%.2fms transfer=%.2fms deserialize=%.2fms",
+                        "Done payload=%s | e2e=%.4fs (%.2f Gbps) | send=%.2fms receive=%.2fms pull=%.2fms",
                         payload_human,
                         result["end_to_end_seconds"],
                         result["end_to_end_gbps"],
-                        timeline_summary["serialize"]["total_ms"],
-                        timeline_summary["transfer"]["total_ms"],
-                        timeline_summary["deserialize"]["total_ms"],
+                        timeline_summary["transfer_send"]["total_ms"],
+                        timeline_summary["transfer_receive"]["total_ms"],
+                        timeline_summary["receive_pull_request"]["total_ms"],
                     )
                 except Exception as exc:
                     error_result = {
