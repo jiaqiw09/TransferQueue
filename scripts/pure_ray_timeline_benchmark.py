@@ -202,9 +202,17 @@ def classify_event(event: dict[str, Any]) -> str | None:
 
 
 def dump_object_transfer_timeline(timeline_path: str) -> None:
-    if not hasattr(ray, "object_transfer_timeline"):
-        raise RuntimeError("Current Ray version does not expose ray.object_transfer_timeline(...)")
-    ray.object_transfer_timeline(filename=timeline_path)
+    if hasattr(ray, "object_transfer_timeline"):
+        ray.object_transfer_timeline(filename=timeline_path)
+        return
+
+    import ray._private.state as ray_state
+
+    if hasattr(ray_state, "object_transfer_timeline"):
+        ray_state.object_transfer_timeline(filename=timeline_path)
+        return
+
+    raise RuntimeError("Current Ray version does not expose object_transfer_timeline(...)")
 
 
 def summarize_object_transfer_trace(timeline_path: str) -> dict[str, Any]:
