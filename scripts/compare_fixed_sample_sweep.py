@@ -75,6 +75,15 @@ def build_compare_row(
 ) -> dict[str, Any]:
     payload_mb = sample_count * sample_size_mb
     payload_bytes = tq_result["payload_bytes"] if "payload_bytes" in tq_result else ray_result["payload_bytes"]
+    tq_put_seconds = tq_result.get("put_seconds")
+    tq_transfer_seconds = tq_result.get("metadata_transfer_seconds")
+    tq_read_seconds = tq_result.get("read_seconds")
+    tq_three_stage_total_seconds = tq_result.get("total_seconds")
+    ray_put_seconds = ray_result.get("writer_put_seconds")
+    ray_get_seconds = ray_result.get("reader_consume_seconds")
+    ray_two_stage_total_seconds = None
+    if ray_put_seconds is not None and ray_get_seconds is not None:
+        ray_two_stage_total_seconds = ray_put_seconds + ray_get_seconds
     return {
         "sample_count": sample_count,
         "sample_size_mb": sample_size_mb,
@@ -82,27 +91,14 @@ def build_compare_row(
         "payload_human": format_mb(payload_mb),
         "round": round_idx,
         "payload_bytes": payload_bytes,
-        "tq_create_seconds": tq_result.get("create_seconds"),
-        "tq_put_seconds": tq_result.get("put_seconds"),
-        "tq_metadata_transfer_seconds": tq_result.get("metadata_transfer_seconds"),
-        "tq_read_seconds": tq_result.get("read_seconds"),
-        "tq_total_seconds": tq_result.get("total_seconds"),
-        "tq_put_gbps": tq_result.get("put_gbps"),
-        "tq_read_gbps": tq_result.get("read_gbps"),
-        "tq_metadata_ray_bytes": tq_result.get("metadata_ray_bytes"),
-        "ray_create_seconds": ray_result.get("writer_create_seconds"),
-        "ray_put_seconds": ray_result.get("writer_put_seconds"),
-        "ray_read_seconds": ray_result.get("reader_consume_seconds"),
-        "ray_total_seconds": ray_result.get("end_to_end_seconds"),
-        "ray_end_to_end_gbps": ray_result.get("end_to_end_gbps"),
-        "ray_transfer_send_ms": ray_result.get("timeline_summary", {}).get("transfer_send", {}).get("total_ms"),
-        "ray_transfer_receive_ms": ray_result.get("timeline_summary", {}).get("transfer_receive", {}).get("total_ms"),
-        "ray_receive_pull_request_ms": ray_result.get("timeline_summary", {})
-        .get("receive_pull_request", {})
-        .get("total_ms"),
-        "ray_writer_node_ip": ray_result.get("writer_node_ip"),
-        "ray_reader_node_ip": ray_result.get("reader_node_ip"),
-        "ray_object_transfer_timeline_file": ray_result.get("object_transfer_timeline_file"),
+        "tq_put_seconds": tq_put_seconds,
+        "tq_transfer_seconds": tq_transfer_seconds,
+        "tq_read_seconds": tq_read_seconds,
+        "tq_three_stage_total_seconds": tq_three_stage_total_seconds,
+        "ray_put_seconds": ray_put_seconds,
+        "ray_get_seconds": ray_get_seconds,
+        "ray_two_stage_total_seconds": ray_two_stage_total_seconds,
+        "ray_end_to_end_seconds": ray_result.get("end_to_end_seconds"),
         "tq_result_json": str(tq_json),
         "ray_result_json": str(ray_json),
     }
@@ -116,25 +112,14 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "payload_human",
         "round",
         "payload_bytes",
-        "tq_create_seconds",
         "tq_put_seconds",
-        "tq_metadata_transfer_seconds",
+        "tq_transfer_seconds",
         "tq_read_seconds",
-        "tq_total_seconds",
-        "tq_put_gbps",
-        "tq_read_gbps",
-        "tq_metadata_ray_bytes",
-        "ray_create_seconds",
+        "tq_three_stage_total_seconds",
         "ray_put_seconds",
-        "ray_read_seconds",
-        "ray_total_seconds",
-        "ray_end_to_end_gbps",
-        "ray_transfer_send_ms",
-        "ray_transfer_receive_ms",
-        "ray_receive_pull_request_ms",
-        "ray_writer_node_ip",
-        "ray_reader_node_ip",
-        "ray_object_transfer_timeline_file",
+        "ray_get_seconds",
+        "ray_two_stage_total_seconds",
+        "ray_end_to_end_seconds",
         "tq_result_json",
         "ray_result_json",
     ]
@@ -172,8 +157,8 @@ def main() -> None:
     parser.add_argument(
         "--ray-timeline-dir",
         type=str,
-        default="ray_object_transfer_compare_outputs",
-        help="Directory for pure Ray object transfer traces",
+        default=None,
+        help="Optional directory for pure Ray object transfer traces",
     )
     parser.add_argument(
         "--artifacts-dir",
@@ -204,8 +189,9 @@ def main() -> None:
 
     artifacts_dir = Path(args.artifacts_dir)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    ray_timeline_dir = Path(args.ray_timeline_dir)
-    ray_timeline_dir.mkdir(parents=True, exist_ok=True)
+    ray_timeline_dir = Path(args.ray_timeline_dir) if args.ray_timeline_dir else None
+    if ray_timeline_dir is not None:
+        ray_timeline_dir.mkdir(parents=True, exist_ok=True)
 
     compare_rows = []
     raw_results = []
@@ -223,8 +209,10 @@ def main() -> None:
         tq_output_csv = artifacts_dir / f"tq_samples_{sample_count}.csv"
         ray_output_json = artifacts_dir / f"ray_samples_{sample_count}.json"
         ray_output_csv = artifacts_dir / f"ray_samples_{sample_count}.csv"
-        per_count_timeline_dir = ray_timeline_dir / f"samples_{sample_count}"
-        per_count_timeline_dir.mkdir(parents=True, exist_ok=True)
+        per_count_timeline_dir = None
+        if ray_timeline_dir is not None:
+            per_count_timeline_dir = ray_timeline_dir / f"samples_{sample_count}"
+            per_count_timeline_dir.mkdir(parents=True, exist_ok=True)
 
         tq_cmd = [
             sys.executable,
@@ -268,13 +256,13 @@ def main() -> None:
             str(sample_count),
             "--rounds",
             str(args.rounds),
-            "--timeline-dir",
-            str(per_count_timeline_dir),
             "--summary-csv",
             str(ray_output_csv),
             "--output",
             str(ray_output_json),
         ]
+        if per_count_timeline_dir is not None:
+            ray_cmd.extend(["--timeline-dir", str(per_count_timeline_dir)])
         run_command(ray_cmd, repo_root)
         ray_payload = load_json(ray_output_json)
 

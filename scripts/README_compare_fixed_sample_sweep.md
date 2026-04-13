@@ -48,7 +48,7 @@
 - 一份总 CSV
 - 每个 sample_count 对应的 TQ 原始 JSON/CSV
 - 每个 sample_count 对应的 Ray 原始 JSON/CSV
-- 每个 sample_count 对应的 Ray object transfer trace
+- 如果传了 `--ray-timeline-dir`，还会额外输出每个 sample_count 对应的 Ray object transfer trace
 
 ## 推荐启动方式
 
@@ -62,7 +62,6 @@ python scripts/compare_fixed_sample_sweep.py \
   --tq-shards 8 \
   --rounds 1 \
   --ray-payload-kind cpu-torch \
-  --ray-timeline-dir ray_object_transfer_compare_outputs \
   --artifacts-dir compare_fixed_sample_artifacts \
   --output-json compare_fixed_sample_sweep.json \
   --output-csv compare_fixed_sample_sweep.csv
@@ -93,24 +92,25 @@ python scripts/compare_fixed_sample_sweep.py \
 - `payload_mb`
 - `payload_human`
 - `tq_put_seconds`
-- `tq_metadata_transfer_seconds`
+- `tq_transfer_seconds`
 - `tq_read_seconds`
-- `tq_total_seconds`
+- `tq_three_stage_total_seconds`
 - `ray_put_seconds`
-- `ray_read_seconds`
-- `ray_total_seconds`
-- `ray_transfer_send_ms`
-- `ray_transfer_receive_ms`
-- `ray_receive_pull_request_ms`
-- `ray_writer_node_ip`
-- `ray_reader_node_ip`
-- `ray_object_transfer_timeline_file`
+- `ray_get_seconds`
+- `ray_two_stage_total_seconds`
+- `ray_end_to_end_seconds`
 
 ## 前置条件
 
 先按你原来的方式启动 Ray 集群。
 
-如果你还要看 Ray object transfer trace，建议在两台机器上都先设置：
+如果你还要看 Ray object transfer trace，可以额外传：
+
+```bash
+--ray-timeline-dir ray_object_transfer_compare_outputs
+```
+
+这时建议在两台机器上都先设置：
 
 ```bash
 export RAY_PROFILING=1

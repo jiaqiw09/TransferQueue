@@ -91,7 +91,6 @@ python scripts/compare_fixed_sample_sweep.py \
   --tq-shards 8 \
   --rounds 1 \
   --ray-payload-kind cpu-torch \
-  --ray-timeline-dir ray_object_transfer_compare_outputs \
   --artifacts-dir compare_fixed_sample_artifacts \
   --output-json compare_fixed_sample_sweep.json \
   --output-csv compare_fixed_sample_sweep.csv
