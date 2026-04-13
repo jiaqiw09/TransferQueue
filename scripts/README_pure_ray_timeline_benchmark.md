@@ -218,6 +218,13 @@ python scripts/pure_ray_timeline_benchmark.py \
 <output 同名>.csv
 ```
 
+如果你不传 `--timeline-dir`：
+
+- 脚本仍然会输出 `writer_put_seconds`
+- 脚本仍然会输出 `reader_consume_seconds`
+- 脚本仍然会输出 `end_to_end_seconds`
+- 但是不会导出 object transfer trace
+
 ## 可选参数
 
 - `--payload-kind`
@@ -231,7 +238,7 @@ python scripts/pure_ray_timeline_benchmark.py \
 - `--size-list-mb`
   自定义 size 列表，比如 `16,32,64,128,256`
 - `--timeline-dir`
-  object transfer trace 文件输出目录
+  object transfer trace 文件输出目录；如果不传，就不会导出 trace
 - `--summary-csv`
   CSV 汇总表输出路径
 - `--stop-on-error`

@@ -27,6 +27,7 @@ from typing import Any
 
 import numpy as np
 import ray
+from ray.util import get_node_ip_address
 
 repo_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(repo_root))
@@ -260,6 +261,16 @@ def warn_if_timeline_env_missing() -> None:
         )
 
 
+def empty_transfer_summary() -> dict[str, Any]:
+    return {
+        "total_events": 0,
+        "transfer_send": {"event_count": 0, "total_us": 0.0, "total_ms": 0.0},
+        "transfer_receive": {"event_count": 0, "total_us": 0.0, "total_ms": 0.0},
+        "receive_pull_request": {"event_count": 0, "total_us": 0.0, "total_ms": 0.0},
+        "other": {"event_count": 0, "total_us": 0.0, "total_ms": 0.0},
+    }
+
+
 def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     rows = []
     for result in results:
@@ -289,6 +300,8 @@ def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]
                 "end_to_end_seconds": result["end_to_end_seconds"],
                 "end_to_end_gbps": result["end_to_end_gbps"],
                 "writer_payload_bytes": result["writer_payload_bytes"],
+                "writer_node_ip": result.get("writer_node_ip", ""),
+                "reader_node_ip": result.get("reader_node_ip", ""),
                 "writer_device": result["writer_device"],
                 "reader_device": result["reader_device"],
                 "transfer_send_ms": timeline_summary["transfer_send"]["total_ms"],
@@ -317,6 +330,8 @@ def write_summary_csv(csv_path: str, rows: list[dict[str, Any]]) -> None:
         "end_to_end_seconds",
         "end_to_end_gbps",
         "writer_payload_bytes",
+        "writer_node_ip",
+        "reader_node_ip",
         "writer_device",
         "reader_device",
         "transfer_send_ms",
@@ -361,6 +376,11 @@ class WriterActor:
                 if not hasattr(self.torch, "npu") or not self.torch.npu.is_available():
                     raise RuntimeError("payload-kind=npu-torch requires torch.npu to be available")
                 self.torch.npu.set_device(npu_device)
+
+    def get_runtime_info(self) -> dict[str, Any]:
+        return {
+            "node_ip": get_node_ip_address(),
+        }
 
     def _create_payload(self, payload_bytes: int):
         if self.payload_kind == "cpu-numpy":
@@ -433,6 +453,11 @@ class ReaderActor:
                 if not hasattr(self.torch, "npu") or not self.torch.npu.is_available():
                     raise RuntimeError("payload-kind=npu-torch requires torch.npu to be available")
                 self.torch.npu.set_device(npu_device)
+
+    def get_runtime_info(self) -> dict[str, Any]:
+        return {
+            "node_ip": get_node_ip_address(),
+        }
 
     def consume_object_ref(self, payload_packet: dict[str, Any]) -> dict[str, Any]:
         receive_start = time.perf_counter()
@@ -511,8 +536,8 @@ def main() -> None:
     parser.add_argument(
         "--timeline-dir",
         type=str,
-        default="ray_timeline_outputs",
-        help="Directory to store raw Ray object transfer trace dumps",
+        default=None,
+        help="Optional directory to store raw Ray object transfer trace dumps. If omitted, no trace is dumped.",
     )
     parser.add_argument(
         "--output",
@@ -540,8 +565,9 @@ def main() -> None:
         end_gb=args.end_gb,
         multiplier=args.multiplier,
     )
-    timeline_dir = Path(args.timeline_dir)
-    timeline_dir.mkdir(parents=True, exist_ok=True)
+    timeline_dir = Path(args.timeline_dir) if args.timeline_dir else None
+    if timeline_dir is not None:
+        timeline_dir.mkdir(parents=True, exist_ok=True)
     summary_csv = args.summary_csv or str(Path(args.output).with_suffix(".csv"))
 
     cwd = os.getcwd()
@@ -578,6 +604,13 @@ def main() -> None:
             resources={f"node:{args.reader_ip}": 0.001},
             runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
         ).remote(args.payload_kind, args.reader_npu_device)
+        writer_runtime = ray.get(writer.get_runtime_info.remote())
+        reader_runtime = ray.get(reader.get_runtime_info.remote())
+        logger.info(
+            "Resolved runtime nodes: writer_node_ip=%s reader_node_ip=%s",
+            writer_runtime["node_ip"],
+            reader_runtime["node_ip"],
+        )
 
         for payload_bytes in sweep_sizes:
             for round_idx in range(args.rounds):
@@ -598,12 +631,16 @@ def main() -> None:
 
                     payload_packet = ray.get(payload_ref)
 
-                    timeline_filename = (
-                        f"object_transfer_timeline_{sanitize_name(payload_human)}_round{round_idx + 1}.json"
-                    )
-                    timeline_path = timeline_dir / timeline_filename
-                    dump_object_transfer_timeline(str(timeline_path))
-                    timeline_summary = summarize_object_transfer_trace(str(timeline_path))
+                    timeline_path = None
+                    if timeline_dir is not None:
+                        timeline_filename = (
+                            f"object_transfer_timeline_{sanitize_name(payload_human)}_round{round_idx + 1}.json"
+                        )
+                        timeline_path = timeline_dir / timeline_filename
+                        dump_object_transfer_timeline(str(timeline_path))
+                        timeline_summary = summarize_object_transfer_trace(str(timeline_path))
+                    else:
+                        timeline_summary = empty_transfer_summary()
 
                     result = {
                         "round": round_idx + 1,
@@ -611,9 +648,11 @@ def main() -> None:
                         "reader_ip": args.reader_ip,
                         "payload_bytes": payload_bytes,
                         "payload_human": payload_human,
-                        "object_transfer_timeline_file": str(timeline_path),
+                        "object_transfer_timeline_file": str(timeline_path) if timeline_path is not None else "",
                         "end_to_end_seconds": end_to_end_seconds,
                         "end_to_end_gbps": bytes_to_gbps(payload_bytes, end_to_end_seconds),
+                        "writer_node_ip": writer_runtime["node_ip"],
+                        "reader_node_ip": reader_runtime["node_ip"],
                         "writer_device": payload_packet["device"],
                         "writer_dtype": payload_packet["dtype"],
                         "writer_shape": payload_packet["shape"],
@@ -633,10 +672,12 @@ def main() -> None:
                     results.append(result)
 
                     logger.info(
-                        "Done payload=%s | e2e=%.4fs (%.2f Gbps) | send=%.2fms receive=%.2fms pull=%.2fms",
+                        "Done payload=%s | e2e=%.4fs (%.2f Gbps) | writer_node=%s reader_node=%s | send=%.2fms receive=%.2fms pull=%.2fms",
                         payload_human,
                         result["end_to_end_seconds"],
                         result["end_to_end_gbps"],
+                        result["writer_node_ip"],
+                        result["reader_node_ip"],
                         timeline_summary["transfer_send"]["total_ms"],
                         timeline_summary["transfer_receive"]["total_ms"],
                         timeline_summary["receive_pull_request"]["total_ms"],
