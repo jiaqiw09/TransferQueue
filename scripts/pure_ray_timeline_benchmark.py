@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import io
 import argparse
 import csv
 import json
@@ -22,12 +23,14 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import ray
 from ray.util import get_node_ip_address
+from tensordict import TensorDict, TensorDictBase
 
 repo_root = Path(__file__).resolve().parent.parent
 sys.path.append(str(repo_root))
@@ -80,6 +83,38 @@ def bytes_to_gbps(num_bytes: int, seconds: float) -> float:
     if seconds <= 0:
         return 0.0
     return (num_bytes * 8) / seconds / 1e9
+
+
+@dataclass
+class DataProtoLike:
+    """Small verl-style payload wrapper used to mimic rollout DataProto transport."""
+
+    batch: TensorDict
+    non_tensor_batch: dict[str, Any] = field(default_factory=dict)
+    meta_info: dict[str, Any] = field(default_factory=dict)
+
+    def __getstate__(self):
+        buffer = io.BytesIO()
+        batch = self.batch
+        if hasattr(batch, "contiguous"):
+            batch = batch.contiguous()
+        if hasattr(batch, "consolidate"):
+            batch = batch.consolidate()
+        torch = import_torch_modules()[0]
+        torch.save(batch, buffer)
+        return buffer.getvalue(), self.non_tensor_batch, self.meta_info
+
+    def __setstate__(self, state):
+        batch_bytes, non_tensor_batch, meta_info = state
+        buffer = io.BytesIO(batch_bytes)
+        torch = import_torch_modules()[0]
+        try:
+            batch = torch.load(buffer, weights_only=False)
+        except TypeError:
+            batch = torch.load(buffer)
+        self.batch = batch
+        self.non_tensor_batch = non_tensor_batch
+        self.meta_info = meta_info
 
 
 def compute_chunk_sizes(payload_bytes: int, num_chunks: int, itemsize: int) -> tuple[int, int]:
@@ -158,7 +193,68 @@ def compute_bytes_for_payload(payload: Any) -> int:
     if torch is not None and isinstance(payload, torch.Tensor):
         return int(payload.numel() * payload.element_size())
 
+    if isinstance(payload, TensorDictBase):
+        return sum(compute_bytes_for_payload(value) for _, value in payload.items())
+
+    if isinstance(payload, DataProtoLike):
+        return compute_bytes_for_payload(payload.batch)
+
+    if isinstance(payload, dict):
+        return sum(compute_bytes_for_payload(value) for value in payload.values())
+
+    if isinstance(payload, (list, tuple)):
+        return sum(compute_bytes_for_payload(value) for value in payload)
+
     raise TypeError(f"Unsupported payload type for size calculation: {type(payload)}")
+
+
+def iter_tensor_leaves(payload: Any):
+    try:
+        torch, _ = import_torch_modules()
+    except RuntimeError:
+        torch = None
+
+    if torch is not None and isinstance(payload, torch.Tensor):
+        yield payload
+        return
+    if isinstance(payload, np.ndarray):
+        yield payload
+        return
+    if isinstance(payload, TensorDictBase):
+        for _, value in payload.items():
+            yield from iter_tensor_leaves(value)
+        return
+    if isinstance(payload, DataProtoLike):
+        yield from iter_tensor_leaves(payload.batch)
+        return
+    if isinstance(payload, dict):
+        for value in payload.values():
+            yield from iter_tensor_leaves(value)
+        return
+    if isinstance(payload, (list, tuple)):
+        for value in payload:
+            yield from iter_tensor_leaves(value)
+
+
+def tensor_checksum(payload: Any) -> float:
+    try:
+        torch, _ = import_torch_modules()
+    except RuntimeError:
+        torch = None
+
+    total = 0.0
+    for leaf in iter_tensor_leaves(payload):
+        if isinstance(leaf, np.ndarray):
+            total += float(np.sum(leaf[: min(leaf.size, 1024)], dtype=np.float64))
+        elif torch is not None and isinstance(leaf, torch.Tensor):
+            total += float(leaf[: min(leaf.numel(), 1024)].float().sum().item())
+    return total
+
+
+def first_tensor_leaf(payload: Any) -> Any:
+    for leaf in iter_tensor_leaves(payload):
+        return leaf
+    return None
 
 
 def load_timeline_events(timeline_path: str) -> list[dict[str, Any]]:
@@ -370,7 +466,7 @@ class WriterActor:
         self.numpy_dtype = np.dtype(dtype) if payload_kind == "cpu-numpy" else None
         self.torch = None
 
-        if payload_kind in ("cpu-torch", "npu-torch"):
+        if payload_kind in ("cpu-torch", "npu-torch", "verl-dataproto"):
             self.torch, _ = import_torch_modules()
             if payload_kind == "npu-torch":
                 if not hasattr(self.torch, "npu") or not self.torch.npu.is_available():
@@ -383,6 +479,34 @@ class WriterActor:
         }
 
     def _create_payload(self, payload_bytes: int):
+        if self.payload_kind == "verl-dataproto":
+            assert self.torch is not None
+            torch = self.torch
+            torch_dtype = getattr(torch, self.dtype_name, None)
+            if torch_dtype is None:
+                raise ValueError(f"Unsupported torch dtype: {self.dtype_name}")
+            itemsize = torch.tensor([], dtype=torch_dtype).element_size()
+            num_chunks, chunk_num_elements = compute_chunk_sizes(payload_bytes, self.num_chunks, itemsize)
+
+            response_ids = torch.full(
+                (num_chunks, chunk_num_elements),
+                self.fill_value,
+                dtype=torch_dtype,
+                device="cpu",
+            )
+            batch = TensorDict({"response_ids": response_ids}, batch_size=(num_chunks,))
+            non_tensor_batch = {
+                "raw_prompt": [f"prompt_{idx}" for idx in range(num_chunks)],
+                "sample_ids": list(range(num_chunks)),
+            }
+            meta_info = {
+                "kind": "verl-roll",
+                "sample_count": num_chunks,
+                "chunk_num_elements": chunk_num_elements,
+            }
+            payload = DataProtoLike(batch=batch, non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+            return payload, int(chunk_num_elements), str(torch_dtype), [chunk_num_elements], str(response_ids.device)
+
         if self.payload_kind == "cpu-numpy":
             assert self.numpy_dtype is not None
             num_chunks, chunk_num_elements = compute_chunk_sizes(payload_bytes, self.num_chunks, self.numpy_dtype.itemsize)
@@ -413,26 +537,34 @@ class WriterActor:
         create_seconds = time.perf_counter() - create_start
 
         put_start = time.perf_counter()
-        object_refs = []
-        for payload in payloads:
-            if (
-                self.payload_kind == "npu-torch"
-                and self.tensor_transport
-                and self.torch is not None
-                and isinstance(payload, self.torch.Tensor)
-            ):
-                object_ref = ray.put(payload, _tensor_transport=self.tensor_transport)
-            else:
-                object_ref = ray.put(payload)
-            object_refs.append(object_ref)
+        if self.payload_kind == "verl-dataproto":
+            payload = payloads
+            object_ref = ray.put(payload)
+            object_refs = [object_ref]
+            payload_sample_count = int(payload.meta_info.get("sample_count", 1))
+        else:
+            object_refs = []
+            for payload in payloads:
+                if (
+                    self.payload_kind == "npu-torch"
+                    and self.tensor_transport
+                    and self.torch is not None
+                    and isinstance(payload, self.torch.Tensor)
+                ):
+                    object_ref = ray.put(payload, _tensor_transport=self.tensor_transport)
+                else:
+                    object_ref = ray.put(payload)
+                object_refs.append(object_ref)
+            payload_sample_count = len(object_refs)
         put_seconds = time.perf_counter() - put_start
-        payload_bytes_actual = sum(compute_bytes_for_payload(payload) for payload in payloads)
+        payload_bytes_actual = compute_bytes_for_payload(payloads)
 
         return {
             "object_refs": object_refs,
+            "object_ref": object_refs[0] if len(object_refs) == 1 else None,
             "payload_bytes": payload_bytes_actual,
             "chunk_num_elements": chunk_num_elements,
-            "num_chunks": len(payloads),
+            "num_chunks": payload_sample_count,
             "dtype": dtype_name,
             "shape": shape,
             "device": device,
@@ -461,25 +593,33 @@ class ReaderActor:
 
     def consume_object_ref(self, payload_packet: dict[str, Any]) -> dict[str, Any]:
         receive_start = time.perf_counter()
-        payloads = ray.get(payload_packet["object_refs"])
+        if "object_ref" in payload_packet and payload_packet["object_ref"] is not None:
+            payload = ray.get(payload_packet["object_ref"])
+            payloads = [payload.batch] if isinstance(payload, DataProtoLike) else [payload]
+        else:
+            payloads = ray.get(payload_packet["object_refs"])
         receive_seconds = time.perf_counter() - receive_start
 
         first_payload = payloads[0]
         if isinstance(first_payload, np.ndarray):
-            checksum = float(
-                sum(np.sum(payload[: min(payload.size, 1024)], dtype=np.float64) for payload in payloads)
-            )
+            checksum = float(sum(np.sum(payload[: min(payload.size, 1024)], dtype=np.float64) for payload in payloads))
             shape = list(first_payload.shape)
             dtype = str(first_payload.dtype)
             device = "cpu"
+        elif isinstance(first_payload, TensorDictBase):
+            checksum = tensor_checksum(first_payload)
+            tensor_leaf = first_tensor_leaf(first_payload)
+            if tensor_leaf is None:
+                raise RuntimeError("TensorDict payload did not contain any tensor leaves")
+            shape = list(tensor_leaf.shape)
+            dtype = str(tensor_leaf.dtype)
+            device = str(tensor_leaf.device)
         else:
             assert self.torch is not None
             torch = self.torch
             if not isinstance(first_payload, torch.Tensor):
                 raise TypeError(f"Unexpected payload type: {type(first_payload)}")
-            checksum = float(
-                sum(payload[: min(payload.numel(), 1024)].float().sum().item() for payload in payloads)
-            )
+            checksum = float(sum(payload[: min(payload.numel(), 1024)].float().sum().item() for payload in payloads))
             shape = list(first_payload.shape)
             dtype = str(first_payload.dtype)
             device = str(first_payload.device)
@@ -515,7 +655,7 @@ def main() -> None:
         "--payload-kind",
         type=str,
         default="cpu-torch",
-        choices=["cpu-numpy", "cpu-torch", "npu-torch"],
+        choices=["cpu-numpy", "cpu-torch", "npu-torch", "verl-dataproto"],
         help="Payload materialization mode. Default is cpu-torch for CPU-path benchmarking.",
     )
     parser.add_argument(

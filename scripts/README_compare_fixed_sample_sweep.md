@@ -28,6 +28,8 @@
   - `chunks = sample_count`
 - Ray 默认：
   - `chunks = sample_count`
+- 如果你想更贴近 verl rollout 的 `DataProto`，可以把 Ray 改成：
+  - `--ray-payload-kind verl-dataproto`
 
 所以：
 
@@ -61,7 +63,7 @@ python scripts/compare_fixed_sample_sweep.py \
   --sample-size-mb 256 \
   --tq-shards 8 \
   --rounds 1 \
-  --ray-payload-kind cpu-torch \
+  --ray-payload-kind verl-dataproto \
   --artifacts-dir compare_fixed_sample_artifacts \
   --output-json compare_fixed_sample_sweep.json \
   --output-csv compare_fixed_sample_sweep.csv

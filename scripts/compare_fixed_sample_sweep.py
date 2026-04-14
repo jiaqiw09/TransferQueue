@@ -151,7 +151,7 @@ def main() -> None:
         "--ray-payload-kind",
         type=str,
         default="cpu-torch",
-        choices=["cpu-numpy", "cpu-torch", "npu-torch"],
+        choices=["cpu-numpy", "cpu-torch", "npu-torch", "verl-dataproto"],
         help="Payload mode for pure Ray benchmark",
     )
     parser.add_argument(

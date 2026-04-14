@@ -41,6 +41,14 @@
 - 对每个 chunk 执行 `ray.put(...)`
 - 在远端通过 `ray.get([...])` 一次性读取所有 chunk
 
+如果你想更贴近 verl 里 rollout 的 `DataProto` 形态，也可以用：
+
+```bash
+--payload-kind verl-dataproto
+```
+
+这个模式会把一个 `TensorDict` 再包一层 `DataProtoLike`，并通过对象的自定义 `__getstate__` / `__setstate__` 走更接近 verl 的序列化路径。
+
 ## 默认 Sweep
 
 默认会按 2 倍递增从 `16MB` 一路测到 `32GB`：
