@@ -124,6 +124,7 @@
 python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-a-ip 10.0.0.1 \
   --server-b-ip 10.0.0.2 \
+  --benchmarks tq \
   --num-workers 8 \
   --shards 8 \
   --tq-storage-layout all_b \
@@ -142,6 +143,7 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
 python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-a-ip 10.0.0.1 \
   --server-b-ip 10.0.0.2 \
+  --benchmarks tq \
   --num-workers 8 \
   --shards 8 \
   --tq-storage-layout split_ab \
@@ -160,6 +162,7 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
 python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-a-ip 10.0.0.1 \
   --server-b-ip 10.0.0.2 \
+  --benchmarks tq \
   --num-workers 8 \
   --shards 8 \
   --tq-storage-layout all_b \
@@ -190,6 +193,8 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
   每个 payload size 跑几轮
 - `--size-list-mb`
   手工指定测试点位
+- `--benchmarks`
+  选择跑 `both`、`tq` 或 `ray`，默认 `both`
 
 ## 输出文件
 

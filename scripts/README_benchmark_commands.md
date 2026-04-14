@@ -148,6 +148,7 @@ python scripts/tq_fixed_sample_split_storage_sweep.py \
 python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-a-ip 10.0.0.1 \
   --server-b-ip 10.0.0.2 \
+  --benchmarks tq \
   --num-workers 8 \
   --shards 8 \
   --tq-storage-layout all_b \
@@ -164,6 +165,7 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
 python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-a-ip 10.0.0.1 \
   --server-b-ip 10.0.0.2 \
+  --benchmarks tq \
   --num-workers 8 \
   --shards 8 \
   --tq-storage-layout split_ab \

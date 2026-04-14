@@ -497,7 +497,31 @@ def build_summary_csv_rows(results: list[dict[str, Any]]) -> list[dict[str, Any]
             )
             continue
 
-        row = build_compare_row(result)
+        if "tq" in result and "ray" in result:
+            row = build_compare_row(result)
+        else:
+            row = {
+                "payload_bytes": result.get("payload_bytes"),
+                "payload_human": result.get("payload_human"),
+                "round": result.get("round"),
+                "worker_count": result.get("worker_count"),
+                "tq_put_seconds": result.get("tq", {}).get("put_seconds") if "tq" in result else "",
+                "tq_controller_submit_seconds": result.get("tq", {}).get("controller_submit_seconds") if "tq" in result else "",
+                "tq_all_workers_complete_seconds": result.get("tq", {}).get("all_workers_complete_seconds") if "tq" in result else "",
+                "tq_dispatch_total_seconds": result.get("tq", {}).get("dispatch_total_seconds") if "tq" in result else "",
+                "tq_metadata_ray_bytes_single": result.get("tq", {}).get("metadata_ray_bytes_single") if "tq" in result else "",
+                "tq_metadata_ray_bytes_total": result.get("tq", {}).get("metadata_ray_bytes_total") if "tq" in result else "",
+                "tq_worker_read_max_seconds": result.get("tq", {}).get("worker_read_max_seconds") if "tq" in result else "",
+                "tq_worker_read_avg_seconds": result.get("tq", {}).get("worker_read_avg_seconds") if "tq" in result else "",
+                "tq_all_workers_effective_gbps": result.get("tq", {}).get("all_workers_effective_gbps") if "tq" in result else "",
+                "ray_controller_submit_seconds": result.get("ray", {}).get("controller_submit_seconds") if "ray" in result else "",
+                "ray_all_workers_complete_seconds": result.get("ray", {}).get("all_workers_complete_seconds") if "ray" in result else "",
+                "ray_dispatch_total_seconds": result.get("ray", {}).get("dispatch_total_seconds") if "ray" in result else "",
+                "ray_payload_bytes_total_dispatched_estimate": result.get("ray", {}).get("payload_bytes_total_dispatched_estimate") if "ray" in result else "",
+                "ray_worker_handler_max_seconds": result.get("ray", {}).get("worker_handler_max_seconds") if "ray" in result else "",
+                "ray_worker_handler_avg_seconds": result.get("ray", {}).get("worker_handler_avg_seconds") if "ray" in result else "",
+                "ray_all_workers_effective_gbps": result.get("ray", {}).get("all_workers_effective_gbps") if "ray" in result else "",
+            }
         row["status"] = "ok"
         row["error"] = ""
         rows.append(row)
@@ -574,6 +598,13 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int, default=1, help="Benchmark rounds per payload size")
     parser.add_argument("--fill-value", type=float, default=1.0, help="Constant used to materialize payload tensors")
+    parser.add_argument(
+        "--benchmarks",
+        type=str,
+        default="both",
+        choices=["both", "tq", "ray"],
+        help="Which branches to run: both, tq only, or ray only",
+    )
     parser.add_argument(
         "--output",
         type=str,
@@ -670,6 +701,9 @@ def main() -> None:
             for worker_idx in range(args.num_workers)
         ]
 
+        run_tq = args.benchmarks in ("both", "tq")
+        run_ray = args.benchmarks in ("both", "ray")
+
         for payload_bytes in sweep_sizes:
             payload_human = format_bytes(payload_bytes)
             for round_idx in range(args.rounds):
@@ -682,65 +716,69 @@ def main() -> None:
                     partition_id,
                 )
                 try:
-                    tq_write = ray.get(tq_writer.put_payload.remote(payload_bytes, partition_id))
-                    tq_meta = tq_write.pop("metadata")
+                    tq_result = None
+                    if run_tq:
+                        tq_write = ray.get(tq_writer.put_payload.remote(payload_bytes, partition_id))
+                        tq_meta = tq_write.pop("metadata")
 
-                    tq_submit_start = time.perf_counter()
-                    tq_result_refs = [reader.consume_metadata.remote(tq_meta) for reader in tq_readers]
-                    tq_controller_submit_seconds = time.perf_counter() - tq_submit_start
+                        tq_submit_start = time.perf_counter()
+                        tq_result_refs = [reader.consume_metadata.remote(tq_meta) for reader in tq_readers]
+                        tq_controller_submit_seconds = time.perf_counter() - tq_submit_start
 
-                    tq_wait_start = time.perf_counter()
-                    tq_worker_reads = ray.get(tq_result_refs)
-                    tq_all_workers_complete_seconds = time.perf_counter() - tq_wait_start
+                        tq_wait_start = time.perf_counter()
+                        tq_worker_reads = ray.get(tq_result_refs)
+                        tq_all_workers_complete_seconds = time.perf_counter() - tq_wait_start
 
-                    ray.get(tq_writer.clear_partition.remote(partition_id))
+                        ray.get(tq_writer.clear_partition.remote(partition_id))
 
-                    tq_result = build_tq_result(
-                        raw_write=tq_write,
-                        controller_submit_seconds=tq_controller_submit_seconds,
-                        worker_reads=tq_worker_reads,
-                        worker_count=args.num_workers,
-                        payload_bytes=payload_bytes,
-                        payload_human=payload_human,
-                        partition_id=partition_id,
-                    )
-                    tq_result["all_workers_complete_seconds"] = tq_all_workers_complete_seconds
-                    tq_result["dispatch_total_seconds"] = (
-                        tq_result["put_seconds"]
-                        + tq_result["controller_submit_seconds"]
-                        + tq_result["all_workers_complete_seconds"]
-                    )
-                    tq_result["all_workers_effective_gbps"] = bytes_to_gbps(
-                        tq_result["all_workers_read_aggregate_bytes"],
-                        tq_result["all_workers_complete_seconds"],
-                    )
+                        tq_result = build_tq_result(
+                            raw_write=tq_write,
+                            controller_submit_seconds=tq_controller_submit_seconds,
+                            worker_reads=tq_worker_reads,
+                            worker_count=args.num_workers,
+                            payload_bytes=payload_bytes,
+                            payload_human=payload_human,
+                            partition_id=partition_id,
+                        )
+                        tq_result["all_workers_complete_seconds"] = tq_all_workers_complete_seconds
+                        tq_result["dispatch_total_seconds"] = (
+                            tq_result["put_seconds"]
+                            + tq_result["controller_submit_seconds"]
+                            + tq_result["all_workers_complete_seconds"]
+                        )
+                        tq_result["all_workers_effective_gbps"] = bytes_to_gbps(
+                            tq_result["all_workers_read_aggregate_bytes"],
+                            tq_result["all_workers_complete_seconds"],
+                        )
 
-                    ray_payload = ray.get(ray_writer.build_payload.remote(payload_bytes))
-                    payload_obj = ray_payload.pop("payload")
-                    ray_submit_start = time.perf_counter()
-                    ray_result_refs = [reader.consume_payload.remote(payload_obj) for reader in ray_readers]
-                    ray_controller_submit_seconds = time.perf_counter() - ray_submit_start
+                    ray_result = None
+                    if run_ray:
+                        ray_payload = ray.get(ray_writer.build_payload.remote(payload_bytes))
+                        payload_obj = ray_payload.pop("payload")
+                        ray_submit_start = time.perf_counter()
+                        ray_result_refs = [reader.consume_payload.remote(payload_obj) for reader in ray_readers]
+                        ray_controller_submit_seconds = time.perf_counter() - ray_submit_start
 
-                    ray_wait_start = time.perf_counter()
-                    ray_worker_reads = ray.get(ray_result_refs)
-                    ray_all_workers_complete_seconds = time.perf_counter() - ray_wait_start
+                        ray_wait_start = time.perf_counter()
+                        ray_worker_reads = ray.get(ray_result_refs)
+                        ray_all_workers_complete_seconds = time.perf_counter() - ray_wait_start
 
-                    ray_result = build_ray_result(
-                        raw_payload=ray_payload,
-                        controller_submit_seconds=ray_controller_submit_seconds,
-                        worker_receives=ray_worker_reads,
-                        worker_count=args.num_workers,
-                        payload_bytes=payload_bytes,
-                        payload_human=payload_human,
-                    )
-                    ray_result["all_workers_complete_seconds"] = ray_all_workers_complete_seconds
-                    ray_result["dispatch_total_seconds"] = (
-                        ray_result["controller_submit_seconds"] + ray_result["all_workers_complete_seconds"]
-                    )
-                    ray_result["all_workers_effective_gbps"] = bytes_to_gbps(
-                        ray_result["all_workers_aggregate_bytes"],
-                        ray_result["all_workers_complete_seconds"],
-                    )
+                        ray_result = build_ray_result(
+                            raw_payload=ray_payload,
+                            controller_submit_seconds=ray_controller_submit_seconds,
+                            worker_receives=ray_worker_reads,
+                            worker_count=args.num_workers,
+                            payload_bytes=payload_bytes,
+                            payload_human=payload_human,
+                        )
+                        ray_result["all_workers_complete_seconds"] = ray_all_workers_complete_seconds
+                        ray_result["dispatch_total_seconds"] = (
+                            ray_result["controller_submit_seconds"] + ray_result["all_workers_complete_seconds"]
+                        )
+                        ray_result["all_workers_effective_gbps"] = bytes_to_gbps(
+                            ray_result["all_workers_aggregate_bytes"],
+                            ray_result["all_workers_complete_seconds"],
+                        )
 
                     result = {
                         "round": round_idx + 1,
@@ -752,9 +790,13 @@ def main() -> None:
                         "shards": args.shards,
                         "chunks": args.chunks,
                         "tq_storage_ips": storage_ips,
-                        "tq": tq_result,
-                        "ray": ray_result,
-                        "compare": build_compare_row(
+                    }
+                    if tq_result is not None:
+                        result["tq"] = tq_result
+                    if ray_result is not None:
+                        result["ray"] = ray_result
+                    if tq_result is not None and ray_result is not None:
+                        result["compare"] = build_compare_row(
                             {
                                 "round": round_idx + 1,
                                 "payload_bytes": payload_bytes,
@@ -763,19 +805,34 @@ def main() -> None:
                                 "tq": tq_result,
                                 "ray": ray_result,
                             }
-                        ),
-                    }
+                        )
                     results.append(result)
 
-                    logger.info(
-                        "Done payload=%s | TQ put=%.4fs submit=%.4fs wait_all=%.4fs | Ray submit=%.4fs wait_all=%.4fs",
-                        payload_human,
-                        tq_result["put_seconds"],
-                        tq_result["controller_submit_seconds"],
-                        tq_result["all_workers_complete_seconds"],
-                        ray_result["controller_submit_seconds"],
-                        ray_result["all_workers_complete_seconds"],
-                    )
+                    if tq_result is not None and ray_result is not None:
+                        logger.info(
+                            "Done payload=%s | TQ put=%.4fs submit=%.4fs wait_all=%.4fs | Ray submit=%.4fs wait_all=%.4fs",
+                            payload_human,
+                            tq_result["put_seconds"],
+                            tq_result["controller_submit_seconds"],
+                            tq_result["all_workers_complete_seconds"],
+                            ray_result["controller_submit_seconds"],
+                            ray_result["all_workers_complete_seconds"],
+                        )
+                    elif tq_result is not None:
+                        logger.info(
+                            "Done payload=%s | TQ put=%.4fs submit=%.4fs wait_all=%.4fs",
+                            payload_human,
+                            tq_result["put_seconds"],
+                            tq_result["controller_submit_seconds"],
+                            tq_result["all_workers_complete_seconds"],
+                        )
+                    elif ray_result is not None:
+                        logger.info(
+                            "Done payload=%s | Ray submit=%.4fs wait_all=%.4fs",
+                            payload_human,
+                            ray_result["controller_submit_seconds"],
+                            ray_result["all_workers_complete_seconds"],
+                        )
                 except Exception as exc:
                     error_result = {
                         "round": round_idx + 1,
