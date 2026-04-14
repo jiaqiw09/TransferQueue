@@ -3,7 +3,8 @@
 这个脚本专门对应下面这条 `dispatch only` 拓扑：
 
 - 服务器 A 做主控
-- `TQ` 的 writer / controller / `8` 个 `SimpleStorageUnit` 全都在服务器 A
+- `TQ` 的 writer / controller 在服务器 A
+- `TQ` 的 `SimpleStorageUnit` 可以按配置放在服务器 B，或者按 `4/4` 分布在 A/B
 - 服务器 B 上起 `8` 个 worker
 - 这 `8` 个 worker 读的是同一份逻辑 payload
 - 只看 `dispatch`，不看 `collect`
@@ -115,12 +116,17 @@
 - 服务器 A: `10.0.0.1`
 - 服务器 B: `10.0.0.2`
 
+### TQ 全部写到 B 上的 8 个 unit
+
+这也是脚本默认值：
+
 ```bash
 python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-a-ip 10.0.0.1 \
   --server-b-ip 10.0.0.2 \
   --num-workers 8 \
   --shards 8 \
+  --tq-storage-layout all_b \
   --chunks 8 \
   --start-mb 16 \
   --end-gb 32 \
@@ -128,6 +134,24 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --rounds 1 \
   --output dispatch_broadcast_compare.json \
   --summary-csv dispatch_broadcast_compare.csv
+```
+
+### TQ 按 4 个在 A、4 个在 B
+
+```bash
+python scripts/dispatch_only/dispatch_broadcast_compare.py \
+  --server-a-ip 10.0.0.1 \
+  --server-b-ip 10.0.0.2 \
+  --num-workers 8 \
+  --shards 8 \
+  --tq-storage-layout split_ab \
+  --chunks 8 \
+  --start-mb 16 \
+  --end-gb 32 \
+  --multiplier 2 \
+  --rounds 1 \
+  --output dispatch_broadcast_compare_split_ab.json \
+  --summary-csv dispatch_broadcast_compare_split_ab.csv
 ```
 
 如果你想先只压小一点的点位：
@@ -138,6 +162,7 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-b-ip 10.0.0.2 \
   --num-workers 8 \
   --shards 8 \
+  --tq-storage-layout all_b \
   --chunks 8 \
   --size-list-mb 16,32,64,128,256,512,1024 \
   --rounds 1 \
@@ -155,6 +180,10 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
   远端 worker 数，默认 `8`
 - `--shards`
   TQ 的 `SimpleStorageUnit` 数量，默认 `8`
+- `--tq-storage-layout`
+  TQ 存储布局，支持 `all_a`、`all_b`、`split_ab`
+- `--tq-storage-ip-list`
+  显式指定每个 shard 的 IP，优先级高于 `--tq-storage-layout`
 - `--chunks`
   一份逻辑 payload 内部拆成多少个 sample，默认 `8`
 - `--rounds`

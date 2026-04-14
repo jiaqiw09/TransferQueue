@@ -98,6 +98,31 @@ def parse_size_list_mb(size_list_mb: str) -> list[int]:
     return values
 
 
+def parse_ip_list(ip_list: str) -> list[str]:
+    values = []
+    for chunk in ip_list.split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        values.append(value)
+    if not values:
+        raise ValueError("storage-ip-list did not contain any valid IPs")
+    return values
+
+
+def build_storage_ip_list(server_a_ip: str, server_b_ip: str, shards: int, mode: str) -> list[str]:
+    if mode == "all_a":
+        return [server_a_ip] * shards
+    if mode == "all_b":
+        return [server_b_ip] * shards
+    if mode == "split_ab":
+        if shards % 2 != 0:
+            raise ValueError("split_ab requires an even shard count")
+        half = shards // 2
+        return [server_a_ip] * half + [server_b_ip] * half
+    raise ValueError(f"Unsupported storage layout mode: {mode}")
+
+
 def build_tq_config(controller_info: Any, storage_unit_infos: Any, num_storage_units: int) -> Any:
     config = OmegaConf.create(
         {
@@ -222,9 +247,9 @@ def build_dataproto_payload(payload_bytes: int, num_chunks: int, fill_value: flo
     return payload, batch_size, elems_per_chunk
 
 
-def create_storage_units(storage_ip: str, num_storage_units: int, storage_unit_size: int) -> dict[int, Any]:
+def create_storage_units(storage_ips: list[str], storage_unit_size: int) -> dict[int, Any]:
     storage_units = {}
-    for rank in range(num_storage_units):
+    for rank, storage_ip in enumerate(storage_ips):
         storage_units[rank] = SimpleStorageUnit.options(
             num_cpus=1,
             resources={f"node:{storage_ip}": 0.001},
@@ -520,6 +545,19 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=8, help="Number of remote readers/workers on server B")
     parser.add_argument("--shards", type=int, default=8, help="Number of TQ SimpleStorageUnit actors on server A")
     parser.add_argument(
+        "--tq-storage-layout",
+        type=str,
+        default="all_b",
+        choices=["all_a", "all_b", "split_ab"],
+        help="Where to place TQ SimpleStorageUnit actors: all on A, all on B, or split evenly across A/B",
+    )
+    parser.add_argument(
+        "--tq-storage-ip-list",
+        type=str,
+        default=None,
+        help="Optional comma-separated explicit TQ storage placement, one IP per shard. Overrides --tq-storage-layout.",
+    )
+    parser.add_argument(
         "--chunks",
         type=int,
         default=8,
@@ -571,18 +609,26 @@ def main() -> None:
     max_payload_bytes = max(sweep_sizes)
     max_batch_size, _ = compute_chunk_layout(max_payload_bytes, args.chunks)
     storage_unit_size = max(1, (max_batch_size + args.shards - 1) // args.shards)
+    storage_ips = (
+        parse_ip_list(args.tq_storage_ip_list)
+        if args.tq_storage_ip_list
+        else build_storage_ip_list(args.server_a_ip, args.server_b_ip, args.shards, args.tq_storage_layout)
+    )
+    if len(storage_ips) != args.shards:
+        raise ValueError(f"Expected {args.shards} storage IPs, got {len(storage_ips)}")
 
     cwd = os.getcwd()
     if not ray.is_initialized():
         ray.init(address="auto", runtime_env={"working_dir": cwd})
 
     logger.info(
-        "Dispatch benchmark topology: server_a=%s server_b=%s workers=%s tq_shards=%s chunks=%s",
+        "Dispatch benchmark topology: server_a=%s server_b=%s workers=%s tq_shards=%s chunks=%s tq_storage_ips=%s",
         args.server_a_ip,
         args.server_b_ip,
         args.num_workers,
         args.shards,
         args.chunks,
+        storage_ips,
     )
     logger.info("Sweep sizes: %s", ", ".join(format_bytes(size) for size in sweep_sizes))
 
@@ -596,7 +642,7 @@ def main() -> None:
 
     try:
         controller = TransferQueueController.options(resources={f"node:{args.server_a_ip}": 0.001}).remote()
-        storage_units = create_storage_units(args.server_a_ip, args.shards, storage_unit_size)
+        storage_units = create_storage_units(storage_ips, storage_unit_size)
         controller_info = process_zmq_server_info(controller)
         storage_unit_infos = process_zmq_server_info(storage_units)
         tq_config = build_tq_config(controller_info, storage_unit_infos, args.shards)
@@ -705,6 +751,7 @@ def main() -> None:
                         "server_b_ip": args.server_b_ip,
                         "shards": args.shards,
                         "chunks": args.chunks,
+                        "tq_storage_ips": storage_ips,
                         "tq": tq_result,
                         "ray": ray_result,
                         "compare": build_compare_row(
@@ -749,7 +796,7 @@ def main() -> None:
                     "resolved_config": {
                         "writer_ip": args.server_a_ip,
                         "controller_ip": args.server_a_ip,
-                        "storage_ip": args.server_a_ip,
+                        "storage_ips": storage_ips,
                         "reader_ip": args.server_b_ip,
                     },
                     "results": results,

@@ -150,6 +150,7 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --server-b-ip 10.0.0.2 \
   --num-workers 8 \
   --shards 8 \
+  --tq-storage-layout all_b \
   --chunks 8 \
   --start-mb 16 \
   --end-gb 32 \
@@ -157,4 +158,20 @@ python scripts/dispatch_only/dispatch_broadcast_compare.py \
   --rounds 1 \
   --output dispatch_broadcast_compare.json \
   --summary-csv dispatch_broadcast_compare.csv
+```
+
+```bash
+python scripts/dispatch_only/dispatch_broadcast_compare.py \
+  --server-a-ip 10.0.0.1 \
+  --server-b-ip 10.0.0.2 \
+  --num-workers 8 \
+  --shards 8 \
+  --tq-storage-layout split_ab \
+  --chunks 8 \
+  --start-mb 16 \
+  --end-gb 32 \
+  --multiplier 2 \
+  --rounds 1 \
+  --output dispatch_broadcast_compare_split_ab.json \
+  --summary-csv dispatch_broadcast_compare_split_ab.csv
 ```
