@@ -95,3 +95,18 @@ python scripts/compare_fixed_sample_sweep.py \
   --output-json compare_fixed_sample_sweep.json \
   --output-csv compare_fixed_sample_sweep.csv
 ```
+
+# TQ Fixed 256MB Samples With Split Storage
+
+```bash
+python scripts/tq_fixed_sample_split_storage_sweep.py \
+  --server-a-ip 10.0.0.1 \
+  --server-b-ip 10.0.0.2 \
+  --sample-size-mb 256 \
+  --sample-count-list 1,2,4,8,16,32,64,128 \
+  --shards 8 \
+  --rounds 1 \
+  --artifacts-dir tq_fixed_sample_split_storage_artifacts \
+  --output-json tq_fixed_sample_split_storage_sweep.json \
+  --output-csv tq_fixed_sample_split_storage_sweep.csv
+```

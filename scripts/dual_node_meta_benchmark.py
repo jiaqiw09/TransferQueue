@@ -95,6 +95,18 @@ def parse_size_list_mb(size_list_mb: str) -> list[int]:
     return values
 
 
+def parse_ip_list(ip_list: str) -> list[str]:
+    values = []
+    for chunk in ip_list.split(","):
+        value = chunk.strip()
+        if not value:
+            continue
+        values.append(value)
+    if not values:
+        raise ValueError("storage-ip-list did not contain any valid IPs")
+    return values
+
+
 def build_tq_config(controller_info: Any, storage_unit_infos: Any, num_storage_units: int) -> Any:
     config = OmegaConf.create(
         {
@@ -232,9 +244,9 @@ class WriterActor:
         }
 
 
-def create_storage_units(target_ip: str, num_shards: int, storage_unit_size: int) -> dict[int, Any]:
+def create_storage_units(storage_ips: list[str], storage_unit_size: int) -> dict[int, Any]:
     storage_units = {}
-    for rank in range(num_shards):
+    for rank, target_ip in enumerate(storage_ips):
         storage_units[rank] = SimpleStorageUnit.options(
             num_cpus=1,
             resources={f"node:{target_ip}": 0.001},
@@ -342,6 +354,12 @@ def main() -> None:
     parser.add_argument("--writer-ip", type=str, required=True, help="Node IP for WriterActor (machine A)")
     parser.add_argument("--storage-ip", type=str, required=True, help="Node IP for SimpleStorageUnit actors (machine B)")
     parser.add_argument(
+        "--storage-ip-list",
+        type=str,
+        default=None,
+        help="Optional comma-separated storage placement list, one IP per shard. Example: A,A,A,A,B,B,B,B",
+    )
+    parser.add_argument(
         "--reader-ip",
         type=str,
         default=None,
@@ -399,6 +417,11 @@ def main() -> None:
     reader_ip = args.reader_ip or args.storage_ip
     controller_ip = args.controller_ip or args.writer_ip
     num_chunks = args.chunks or args.shards
+    storage_ips = parse_ip_list(args.storage_ip_list) if args.storage_ip_list else [args.storage_ip] * args.shards
+    if len(storage_ips) != args.shards:
+        raise ValueError(
+            f"storage placement count mismatch: got {len(storage_ips)} IPs but --shards={args.shards}"
+        )
     summary_csv = args.summary_csv or str(Path(args.output).with_suffix(".csv"))
     sweep_sizes = parse_size_list_mb(args.size_list_mb) if args.size_list_mb else build_size_sweep(
         start_mb=args.start_mb,
@@ -414,12 +437,12 @@ def main() -> None:
         ray.init(address="auto", runtime_env={"working_dir": cwd})
 
     logger.info(
-        "Benchmark topology: writer=%s controller=%s storage=%s reader=%s shards=%s",
+        "Benchmark topology: writer=%s controller=%s reader=%s shards=%s storage_layout=%s",
         args.writer_ip,
         controller_ip,
-        args.storage_ip,
         reader_ip,
         args.shards,
+        storage_ips,
     )
     logger.info(
         "Sweep sizes: %s",
@@ -439,7 +462,7 @@ def main() -> None:
 
     try:
         controller = TransferQueueController.options(resources={f"node:{controller_ip}": 0.001}).remote()
-        storage_units = create_storage_units(args.storage_ip, args.shards, storage_unit_size)
+        storage_units = create_storage_units(storage_ips, storage_unit_size)
         controller_info = process_zmq_server_info(controller)
         storage_unit_infos = process_zmq_server_info(storage_units)
         tq_config = build_tq_config(controller_info, storage_unit_infos, args.shards)
@@ -471,6 +494,7 @@ def main() -> None:
                             "round": round_idx + 1,
                             "writer_ip": args.writer_ip,
                             "storage_ip": args.storage_ip,
+                            "storage_ips": storage_ips,
                             "reader_ip": reader_ip,
                             "controller_ip": controller_ip,
                             "shards": args.shards,
@@ -509,6 +533,7 @@ def main() -> None:
                         "reader_ip": reader_ip,
                         "controller_ip": controller_ip,
                         "chunks": num_chunks,
+                        "storage_ips": storage_ips,
                         "storage_unit_size": storage_unit_size,
                         "sweep_sizes_bytes": sweep_sizes,
                     },
